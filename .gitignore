@@ -1,0 +1,23 @@
+# ── Build output ─────────────────────────────────────────────────────────────
+output/
+
+# ── PyInstaller legacy (in case pyinstaller is run without --distpath) ────────
+dist/
+build/
+*.spec.bak
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Runtime / tool artifacts ──────────────────────────────────────────────────
+*.log
+.logs/
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
