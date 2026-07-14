@@ -100,9 +100,15 @@ class ScheduleManager:
         try:
             with open(_SCHEDULE_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            # Back-fill any missing keys added in later versions
+            # Back-fill any missing keys added in later versions.
+            # If last_run_ts is None (rule never ran or was reset), stamp it
+            # with the current time so the rule does NOT fire immediately on
+            # app open — it will first run at the next scheduled time.
+            _now_iso = datetime.now().isoformat(timespec="seconds")
             self._rules = [
-                {**_default_rule(), **r} for r in data.get("rules", [])
+                {**_default_rule(), **r,
+                 "last_run_ts": r.get("last_run_ts") or _now_iso}
+                for r in data.get("rules", [])
             ]
         except (json.JSONDecodeError, OSError):
             self._rules = []
@@ -298,7 +304,9 @@ class BackupScheduler:
 
         last_ts = rule.get("last_run_ts")
         if last_ts is None:
-            return True
+            # Defensive: _load() and add() always stamp last_run_ts, so None
+            # should not occur in normal use. Don't fire to be safe.
+            return False
 
         try:
             last_run = datetime.fromisoformat(last_ts)
