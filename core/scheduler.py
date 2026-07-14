@@ -27,7 +27,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from .notifier import notify_error, notify_success
+from .bundle_manager import BundleManager
+from .notifier       import notify_error, notify_success
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +415,39 @@ class BackupScheduler:
                 self._sched._update_result(rule_id, "error", msg)
                 return
 
+            # ── Bundle: wrap all artifacts into a single .tar ─────────────────
+            # Matches the bundle step in gui/app.py _worker_backup.
+            # On failure we fall back silently to individual file transfer.
+            bm = BundleManager(ssh)
+            inventory = {
+                "db_name":    db_name,
+                "created_at": ts,
+                "files":      {os.path.basename(p): p for p in remote_tmp},
+            }
+            try:
+                bundle_name = BundleManager.bundle_name_for(db_name, ts)
+                bundle_path = f"/tmp/{bundle_name}"
+
+                # Write inventory JSON to server before bundling
+                inv_json_name  = f"{db_name}_{ts}_inventory.json"
+                inv_remote_path = f"/tmp/{inv_json_name}"
+                bm.write_json_to_server(inventory, inv_remote_path)
+
+                all_files = remote_tmp + [inv_remote_path]
+                bm.create(bundle_path, all_files, log_callback=log)
+
+                # Remove the individual files — bundle is the single deliverable
+                for f in all_files:
+                    try:
+                        db_mgr.cleanup_remote(f)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                remote_tmp = [bundle_path]
+                log(f"[{label}] Bundle listo: {bundle_name}")
+            except Exception as bundle_exc:  # noqa: BLE001
+                log(f"[{label}] ADVERTENCIA: no se pudo crear bundle, se transferiran archivos individuales. ({bundle_exc})")
+
             # ── Phase B: transfer to destination ─────────────────────────────
             dest_type = rule.get("dest_type", "gdrive")
 
@@ -477,10 +511,11 @@ class BackupScheduler:
                         sftp_file.close()
                         sftp_sess.close()
 
-                    # Retention cleanup
+                    # Retention cleanup — match bundles by db_name prefix
                     retention = int(rule.get("retention_days", 90))
                     if retention > 0:
-                        prefix = filename.split("_")[0] + "_" + db_name + "_"
+                        # Bundle names: "{db_name}_{ts}_obt.tar"
+                        prefix = f"{db_name}_"
                         deleted = uploader.cleanup_old_files(
                             prefix, retention, log_callback=log
                         )

@@ -33,6 +33,7 @@ from gui.file_browser_panel import FileBrowserPanel
 from gui.ssh_terminal_panel import SshTerminalPanel
 from core.trial_manager import TrialManager
 from core.scheduler import ScheduleManager, BackupScheduler
+from core.bundle_manager import BundleManager
 
 def _add_timestamp(filename: str) -> str:
     """Insert a timestamp before the file extension: file.dump → file_2026-06-25_14-03.dump"""
@@ -514,6 +515,15 @@ class BackupApp:
         # Drive fields stored inside the server profile (Tab 1)
         self._v_prof_gdrive_creds  = tk.StringVar()
         self._v_prof_gdrive_folder = tk.StringVar()
+
+        # Bundle options (Tab 5)
+        self._v_bundle = tk.BooleanVar(value=True)
+
+        # Restore-from-bundle state (Tab 6)
+        self._v_r_restore_mode  = tk.StringVar(value="individual")   # "bundle" | "individual"
+        self._v_r_bundle_local  = tk.StringVar(value="")
+        self._v_r_bundle_src    = tk.StringVar(value="local")        # "local" | "server"
+        self._v_r_bundle_srv    = tk.StringVar(value="")
 
         # ── Restore state variables ───────────────────────────────────────
         # 'origin' | 'dest' | 'other'
@@ -1869,6 +1879,7 @@ class BackupApp:
         ttk.Checkbutton(opt, text="Incluir dump de BD", variable=self._v_inc_db).pack(side="left", padx=_PAD)
         ttk.Checkbutton(opt, text="Incluir filestore", variable=self._v_inc_fs).pack(side="left", padx=_PAD)
         ttk.Checkbutton(opt, text="Limpiar /tmp/ al terminar", variable=self._v_cleanup).pack(side="left", padx=_PAD)
+        ttk.Checkbutton(opt, text="Crear bundle unificado (.tar)", variable=self._v_bundle).pack(side="left", padx=_PAD)
 
         # Progress
         ttk.Label(f, text="Progreso:").grid(row=3, column=0, sticky="w", pady=(_PAD, 2))
@@ -2635,6 +2646,7 @@ class BackupApp:
             "inc_db": self._v_inc_db.get(),
             "inc_fs": self._v_inc_fs.get(),
             "cleanup": self._v_cleanup.get(),
+            "bundle": self._v_bundle.get(),
         }
         if params["dest_type"] == "remote":
             params["dest_host"] = self._dv["host"].get()
@@ -2754,6 +2766,40 @@ class BackupApp:
             self._q.put(("error", f"Error creando backup: {exc}"))
             self._q.put(("btn_enable", None))
             return
+
+        # ── Bundle step: pack dump + filestore + inventory into one .tar ──
+        # Only when bundle=True and there is at least one file to pack.
+        if p.get("bundle", True) and remote_tmp:
+            try:
+                bm = BundleManager(self._ssh)
+                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+                bundle_name = BundleManager.bundle_name_for(p["db"], ts)
+                bundle_path_remote = f"/tmp/{bundle_name}"
+
+                # Write inventory JSON to server so it travels inside the bundle
+                inv_remote_path = None
+                if inventory:
+                    inv_json_name   = f"{p['db']}_{ts}_inventory.json"
+                    inv_remote_path = f"/tmp/{inv_json_name}"
+                    bm.write_json_to_server(inventory, inv_remote_path)
+                    self._log(f"Inventario escrito en servidor: {inv_remote_path}")
+
+                all_files = remote_tmp + ([inv_remote_path] if inv_remote_path else [])
+                bm.create(bundle_path_remote, all_files, log_callback=self._log)
+
+                # Remove individual files — they are now inside the .tar
+                db_mgr_cleanup = DBManager(self._ssh)
+                for f in all_files:
+                    db_mgr_cleanup.cleanup_remote(f)
+
+                # Replace the file list with just the single bundle
+                remote_tmp = [bundle_path_remote]
+                dump_path  = bundle_path_remote   # used for inventory naming in _exec_transfer_and_finish
+                inventory  = None                 # already inside the bundle — skip Step 5
+
+            except Exception as exc_bundle:
+                # Non-fatal: fall back to transferring individual files
+                self._log(f"[aviso] No se pudo crear el bundle, se transferiran archivos individuales: {exc_bundle}")
 
         # ── Phase B: transfer (retryable — files are on the server) ─────
         # Any error here shows the retry panel so the user can change the
@@ -3383,72 +3429,130 @@ class BackupApp:
         sec2.columnconfigure(1, weight=1)
         row += 1
 
+        # ── Modo bundle (opcion prioritaria) ────────────────────────────
+        ttk.Label(sec2, text="Modo de restauracion:", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
+        rb_bundle = ttk.Radiobutton(
+            sec2, text="Desde bundle unificado OBT (.tar)  —  recomendado",
+            variable=self._v_r_restore_mode, value="bundle",
+            command=self._toggle_restore_mode,
+        )
+        rb_bundle.grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(
+            sec2, text="Archivos individuales",
+            variable=self._v_r_restore_mode, value="individual",
+            command=self._toggle_restore_mode,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, _PAD))
+
+        # Bundle path panel
+        self._pnl_bundle = ttk.Frame(sec2)
+        self._pnl_bundle.columnconfigure(1, weight=1)
+        ttk.Radiobutton(
+            self._pnl_bundle, text="Archivo local:",
+            variable=self._v_r_bundle_src, value="local",
+            command=self._toggle_bundle_src,
+        ).grid(row=0, column=0, sticky="w")
+        self._r_bundle_local_entry = ttk.Entry(
+            self._pnl_bundle, textvariable=self._v_r_bundle_local, width=38
+        )
+        self._r_bundle_local_entry.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            self._pnl_bundle, text="...", width=3,
+            command=lambda: self._v_r_bundle_local.set(
+                filedialog.askopenfilename(
+                    title="Seleccionar bundle OBT",
+                    filetypes=[("Bundle OBT", "*.tar"), ("Todos", "*.*")],
+                ) or self._v_r_bundle_local.get()
+            ),
+        ).grid(row=0, column=2)
+        ttk.Radiobutton(
+            self._pnl_bundle, text="Ya en servidor:",
+            variable=self._v_r_bundle_src, value="server",
+            command=self._toggle_bundle_src,
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self._r_bundle_srv_entry = ttk.Entry(
+            self._pnl_bundle, textvariable=self._v_r_bundle_srv, width=38, state="disabled"
+        )
+        self._r_bundle_srv_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(2, 0))
+        self._pnl_bundle.grid(row=3, column=0, columnspan=3, sticky="ew", padx=(20, 0), pady=(0, _PAD))
+
+        # Separator between modes
+        ttk.Separator(sec2, orient="horizontal").grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(0, _PAD)
+        )
+
+        # Individual-file panel (the original sec2 content, now grouped)
+        self._pnl_individual = ttk.Frame(sec2)
+        self._pnl_individual.columnconfigure(1, weight=1)
+
         # Dump file
-        ttk.Label(sec2, text="Dump de BD:", font=("Segoe UI", 9, "bold")).grid(
+        ttk.Label(self._pnl_individual, text="Dump de BD:", font=("Segoe UI", 9, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
         ttk.Radiobutton(
-            sec2, text="Archivo local:", variable=self._v_r_dump_src, value="local",
+            self._pnl_individual, text="Archivo local:", variable=self._v_r_dump_src, value="local",
             command=self._toggle_dump_src,
         ).grid(row=1, column=0, sticky="w")
-        self._r_dump_local_entry = ttk.Entry(sec2, textvariable=self._v_r_dump_local, width=38)
+        pi = self._pnl_individual   # shorthand
+        self._r_dump_local_entry = ttk.Entry(pi, textvariable=self._v_r_dump_local, width=38)
         self._r_dump_local_entry.grid(row=1, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(sec2, text="...", width=3,
+        ttk.Button(pi, text="...", width=3,
             command=lambda: self._browse_file(self._v_r_dump_local, "*.dump *.sql")
         ).grid(row=1, column=2)
 
         ttk.Radiobutton(
-            sec2, text="Ya en servidor:", variable=self._v_r_dump_src, value="server",
+            pi, text="Ya en servidor:", variable=self._v_r_dump_src, value="server",
             command=self._toggle_dump_src,
         ).grid(row=2, column=0, sticky="w", pady=(2, 0))
-        self._r_dump_srv_entry = ttk.Entry(sec2, textvariable=self._v_r_dump_srv, width=38, state="disabled")
+        self._r_dump_srv_entry = ttk.Entry(pi, textvariable=self._v_r_dump_srv, width=38, state="disabled")
         self._r_dump_srv_entry.grid(row=2, column=1, sticky="ew", padx=(4, 4))
 
-        ttk.Separator(sec2, orient="horizontal").grid(
+        ttk.Separator(pi, orient="horizontal").grid(
             row=3, column=0, columnspan=3, sticky="ew", pady=_PAD
         )
 
         # Filestore zip
-        ttk.Label(sec2, text="Filestore ZIP:", font=("Segoe UI", 9, "bold")).grid(
+        ttk.Label(pi, text="Filestore ZIP:", font=("Segoe UI", 9, "bold")).grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
         ttk.Radiobutton(
-            sec2, text="Archivo local:", variable=self._v_r_fs_src, value="local",
+            pi, text="Archivo local:", variable=self._v_r_fs_src, value="local",
             command=self._toggle_fs_src,
         ).grid(row=5, column=0, sticky="w")
-        self._r_fs_local_entry = ttk.Entry(sec2, textvariable=self._v_r_fs_local, width=38)
+        self._r_fs_local_entry = ttk.Entry(pi, textvariable=self._v_r_fs_local, width=38)
         self._r_fs_local_entry.grid(row=5, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(sec2, text="...", width=3,
+        ttk.Button(pi, text="...", width=3,
             command=lambda: self._browse_file(self._v_r_fs_local, "*.zip")
         ).grid(row=5, column=2)
 
         ttk.Radiobutton(
-            sec2, text="Ya en servidor:", variable=self._v_r_fs_src, value="server",
+            pi, text="Ya en servidor:", variable=self._v_r_fs_src, value="server",
             command=self._toggle_fs_src,
         ).grid(row=6, column=0, sticky="w", pady=(2, 0))
-        self._r_fs_srv_entry = ttk.Entry(sec2, textvariable=self._v_r_fs_srv, width=38, state="disabled")
+        self._r_fs_srv_entry = ttk.Entry(pi, textvariable=self._v_r_fs_srv, width=38, state="disabled")
         self._r_fs_srv_entry.grid(row=6, column=1, sticky="ew", padx=(4, 4))
 
         ttk.Radiobutton(
-            sec2, text="No restaurar filestore", variable=self._v_r_fs_src, value="none",
+            pi, text="No restaurar filestore", variable=self._v_r_fs_src, value="none",
             command=self._toggle_fs_src,
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        ttk.Separator(sec2, orient="horizontal").grid(
+        ttk.Separator(pi, orient="horizontal").grid(
             row=8, column=0, columnspan=3, sticky="ew", pady=_PAD
         )
 
         # Inventory file (optional) — companion JSON generated at backup time.
         # When provided, post-restore checks compare against the backup baseline.
         ttk.Label(
-            sec2, text="Inventario backup:",
+            pi, text="Inventario backup:",
             foreground=_C_PURPLE, font=("Segoe UI", 9, "bold"),
         ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
-        self._r_inv_entry = ttk.Entry(sec2, textvariable=self._v_r_inventory)
+        self._r_inv_entry = ttk.Entry(pi, textvariable=self._v_r_inventory)
         self._r_inv_entry.grid(row=10, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=2)
 
-        inv_btn_frame = ttk.Frame(sec2)
+        inv_btn_frame = ttk.Frame(pi)
         inv_btn_frame.grid(row=10, column=2, sticky="w")
         ttk.Button(
             inv_btn_frame, text="...", width=3,
@@ -3460,13 +3564,17 @@ class BackupApp:
         ).pack(side="left")
 
         self._lbl_inv_status = ttk.Label(
-            sec2, text="  Opcional — mejora la precision de las verificaciones",
+            pi, text="  Opcional — mejora la precision de las verificaciones",
             foreground="gray", font=("Segoe UI", 8),
         )
         self._lbl_inv_status.grid(row=11, column=0, columnspan=3, sticky="w")
 
         # Auto-detect inventory when dump path changes
         self._v_r_dump_local.trace_add("write", lambda *_: self._auto_detect_inventory(silent=True))
+
+        # Grid the individual panel into sec2 and apply initial visibility
+        self._pnl_individual.grid(row=5, column=0, columnspan=3, sticky="ew")
+        self._toggle_restore_mode()
 
         # ── Sección 3: Base de datos destino ─────────────────────────────
         sec3 = ttk.LabelFrame(f, text="3. Base de datos destino", padding=_PAD)
@@ -3756,6 +3864,21 @@ class BackupApp:
             )
         return self._ssh_dest
 
+    def _toggle_restore_mode(self) -> None:
+        """Show/hide the bundle vs individual-file panels in Tab 6 Sec 2."""
+        mode = self._v_r_restore_mode.get()
+        if mode == "bundle":
+            self._pnl_bundle.grid()
+            self._pnl_individual.grid_remove()
+        else:
+            self._pnl_bundle.grid_remove()
+            self._pnl_individual.grid()
+
+    def _toggle_bundle_src(self) -> None:
+        local = self._v_r_bundle_src.get() == "local"
+        self._r_bundle_local_entry.config(state="normal" if local else "disabled")
+        self._r_bundle_srv_entry.config(state="disabled" if local else "normal")
+
     def _toggle_dump_src(self) -> None:
         local = self._v_r_dump_src.get() == "local"
         self._r_dump_local_entry.config(state="normal" if local else "disabled")
@@ -3856,19 +3979,23 @@ class BackupApp:
             jobs = 4
 
         params = {
-            "db_name":    self._v_r_db_name.get().strip(),
-            "dump_src":   self._v_r_dump_src.get(),
-            "dump_local": self._v_r_dump_local.get(),
-            "dump_srv":   self._v_r_dump_srv.get(),
-            "fs_src":     self._v_r_fs_src.get(),
-            "fs_local":   self._v_r_fs_local.get(),
-            "fs_srv":     self._v_r_fs_srv.get(),
-            "fs_root":    self._v_r_fs_root.get(),
-            "jobs":       jobs,
-            "neutralize": self._v_r_neutralize.get(),
-            "odoo_conf":  self._v_r_conf.get(),
-            "cleanup":    self._v_r_cleanup.get(),
-            "inventory":  self._v_r_inventory.get().strip(),
+            "db_name":      self._v_r_db_name.get().strip(),
+            "restore_mode": self._v_r_restore_mode.get(),
+            "bundle_src":   self._v_r_bundle_src.get(),
+            "bundle_local": self._v_r_bundle_local.get().strip(),
+            "bundle_srv":   self._v_r_bundle_srv.get().strip(),
+            "dump_src":     self._v_r_dump_src.get(),
+            "dump_local":   self._v_r_dump_local.get(),
+            "dump_srv":     self._v_r_dump_srv.get(),
+            "fs_src":       self._v_r_fs_src.get(),
+            "fs_local":     self._v_r_fs_local.get(),
+            "fs_srv":       self._v_r_fs_srv.get(),
+            "fs_root":      self._v_r_fs_root.get(),
+            "jobs":         jobs,
+            "neutralize":   self._v_r_neutralize.get(),
+            "odoo_conf":    self._v_r_conf.get(),
+            "cleanup":      self._v_r_cleanup.get(),
+            "inventory":    self._v_r_inventory.get().strip(),
         }
 
         threading.Thread(
@@ -3882,6 +4009,71 @@ class BackupApp:
         mgr = RestoreManager(ssh)
         db = p["db_name"]
         uploaded: list[str] = []   # remote paths to clean up on finish
+        _bundle_extract_dir: str = ""  # set when bundle is extracted; cleaned up at end
+
+        # ── Bundle extraction (if mode == "bundle") ───────────────────────
+        if p.get("restore_mode") == "bundle":
+            try:
+                import uuid as _uuid
+                bm = BundleManager(ssh)
+                extract_dir = f"/tmp/obt_restore_{_uuid.uuid4().hex[:8]}"
+                _bundle_extract_dir = extract_dir
+
+                bundle_src = p.get("bundle_src", "local")
+                if bundle_src == "local":
+                    # Upload the local bundle to the server first
+                    bundle_local = p.get("bundle_local", "")
+                    if not bundle_local or not os.path.isfile(bundle_local):
+                        self._q.put(("error", f"Bundle no encontrado: {bundle_local}"))
+                        self._q.put(("btn_r_enable", None))
+                        return
+                    bundle_fname  = os.path.basename(bundle_local)
+                    bundle_remote = f"/tmp/{bundle_fname}"
+                    self._log(f"Subiendo bundle al servidor: {bundle_fname}")
+                    mgr.upload_file(bundle_local, bundle_remote, log_callback=self._log)
+                    uploaded.append(bundle_remote)
+                else:
+                    bundle_remote = p.get("bundle_srv", "")
+                    if not bundle_remote:
+                        self._q.put(("error", "Ruta del bundle en servidor no especificada."))
+                        self._q.put(("btn_r_enable", None))
+                        return
+
+                extracted = bm.extract_on_server(bundle_remote, extract_dir, log_callback=self._log)
+
+                # Override params with extracted paths
+                if extracted.get("dump"):
+                    p["dump_src"] = "server"
+                    p["dump_srv"] = extracted["dump"]
+                else:
+                    self._q.put(("error", "El bundle no contiene un archivo de dump reconocible."))
+                    self._q.put(("btn_r_enable", None))
+                    bm.cleanup_extract_dir(extract_dir)
+                    return
+
+                if extracted.get("filestore"):
+                    p["fs_src"] = "server"
+                    p["fs_srv"] = extracted["filestore"]
+                else:
+                    p["fs_src"] = "none"
+
+                if extracted.get("inventory") and not p.get("inventory"):
+                    inv_dict = bm.read_inventory_from_server(extracted["inventory"])
+                    if inv_dict:
+                        # Save locally so InventoryManager.load() can read it
+                        import tempfile as _tempfile
+                        inv_tmp = _tempfile.NamedTemporaryFile(
+                            suffix="_inventory.json", delete=False, mode="w", encoding="utf-8"
+                        )
+                        import json as _json
+                        _json.dump(inv_dict, inv_tmp, ensure_ascii=False, indent=2)
+                        inv_tmp.close()
+                        p["inventory"] = inv_tmp.name
+
+            except Exception as exc_bundle:
+                self._q.put(("error", f"Error procesando bundle: {exc_bundle}"))
+                self._q.put(("btn_r_enable", None))
+                return
 
         # Load backup inventory if provided (optional — enriches post-restore checks)
         inventory: dict | None = None
@@ -4049,6 +4241,14 @@ class BackupApp:
                 pass
             self._q.put(("error", f"Restauracion fallida:\n{exc}"))
             self._q.put(("btn_r_enable", None))
+        finally:
+            # Clean up bundle extraction directory if one was created
+            if _bundle_extract_dir:
+                try:
+                    BundleManager(ssh).cleanup_extract_dir(_bundle_extract_dir)
+                    self._log(f"Directorio de extraccion eliminado: {_bundle_extract_dir}")
+                except Exception:
+                    pass
 
     # ── Tab 7: Addons Sync ───────────────────────────────────────────────
 
