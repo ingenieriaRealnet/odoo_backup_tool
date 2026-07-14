@@ -58,6 +58,27 @@ class TransferManager:
         code, _, _ = self._ssh.execute(check_cmd, timeout=15)
         return code == 0
 
+    def open_remote_file(self, remote_path: str):
+        """
+        Open a remote file via SFTP for streaming reads without a local copy.
+
+        Returns (sftp_session, sftp_file). The caller must close both when done.
+        prefetch() is called automatically to enable Paramiko read-ahead pipelining
+        for better streaming throughput over high-latency connections.
+
+        Typical usage:
+            sftp_session, sftp_file = transfer.open_remote_file(remote_path)
+            try:
+                ... consume sftp_file.read() ...
+            finally:
+                sftp_file.close()
+                sftp_session.close()
+        """
+        sftp = self._ssh.open_sftp()
+        sftp_file = sftp.open(remote_path, "rb")
+        sftp_file.prefetch()  # pipeline read-ahead for better throughput
+        return sftp, sftp_file
+
     def download_to_local(
         self,
         remote_path: str,

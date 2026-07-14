@@ -22,7 +22,7 @@ try:
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
-    from googleapiclient.http import MediaFileUpload
+    from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
     _GOOGLE_LIBS_OK = True
 except ImportError:
     _GOOGLE_LIBS_OK = False
@@ -279,6 +279,84 @@ class DriveUploader:
                     last_pct = pct
                     if log_callback:
                         log_callback(f"  Subiendo a Drive ... {pct}%")
+
+        file_id = response.get("id", "")
+        if log_callback:
+            log_callback(f"Subida completa a Drive: {filename} (id={file_id})")
+        return file_id
+
+    def upload_stream(
+        self,
+        file_obj,
+        filename: str,
+        total_size: int = 0,
+        progress_callback: Callable[[int, int], None] | None = None,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Upload a file-like object directly to Drive without a local temp copy.
+
+        Data flows: SFTP file → Paramiko read() → MediaIoBaseUpload chunks → Drive API.
+        No local disk is used for the transfer — only a 5 MB in-memory chunk at a time.
+
+        Args:
+            file_obj:          File-like object (e.g. Paramiko SFTPFile opened in 'rb').
+            filename:          Name to give the file in Drive.
+            total_size:        Total byte size for accurate progress reporting (0 = unknown).
+            progress_callback: Called with (bytes_uploaded, total_bytes).
+            log_callback:      Called with human-readable status strings.
+
+        Returns:
+            The Drive file ID of the uploaded file.
+
+        Raises:
+            RuntimeError: On upload errors.
+        """
+        folder_id = self._resolve_target_folder()
+        svc       = self._get_service()
+
+        if log_callback:
+            mb = total_size / (1024 * 1024) if total_size else 0
+            size_str = f" ({mb:.1f} MB)" if total_size else ""
+            log_callback(
+                f"Enviando a Google Drive (streaming){size_str}: {filename} ..."
+            )
+
+        if filename.endswith(".zip"):
+            mime = "application/zip"
+        elif filename.endswith((".dump", ".sql")):
+            mime = "application/octet-stream"
+        elif filename.endswith(".json"):
+            mime = "application/json"
+        else:
+            mime = "application/octet-stream"
+
+        # MediaIoBaseUpload streams from any file-like supporting read() + seek().
+        # Paramiko SFTPFile supports both, making server→Drive streaming possible.
+        media = MediaIoBaseUpload(
+            file_obj, mimetype=mime, chunksize=_CHUNK_SIZE, resumable=True
+        )
+
+        request = svc.files().create(
+            body={"name": filename, "parents": [folder_id]},
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        )
+
+        response  = None
+        last_pct  = -1
+        while response is None:
+            status, response = request.next_chunk()
+            if status and total_size:
+                uploaded = int(status.resumable_progress)
+                if progress_callback:
+                    progress_callback(uploaded, total_size)
+                pct = int(uploaded / total_size * 100)
+                if pct != last_pct:
+                    last_pct = pct
+                    if log_callback:
+                        log_callback(f"  Drive streaming ... {pct}%")
 
         file_id = response.get("id", "")
         if log_callback:

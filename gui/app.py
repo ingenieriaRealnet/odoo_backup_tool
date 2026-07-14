@@ -253,6 +253,13 @@ class BackupApp:
         # Thread -> GUI message queue
         self._q: queue.Queue = queue.Queue()
 
+        # Retry state — set when a transfer fails after files are ready on the server.
+        # Allows re-running only the transfer step with same or different destination.
+        self._retry_remote_tmp:  list[str]   = []
+        self._retry_conn_params: dict        = {}
+        self._retry_dump_path:   str         = ""
+        self._retry_inventory:   dict | None = None
+
         self._build_ui()
         self._poll_queue()
 
@@ -916,6 +923,168 @@ class BackupApp:
         if url:
             webbrowser.open(url)
 
+    # ── Transfer retry ────────────────────────────────────────────────────
+
+    def _show_retry_panel(self, data: dict) -> None:
+        """
+        Reveal the retry panel below the execute buttons.
+
+        Called from the queue handler on a 'transfer_failed' event.
+        Stores retry state so _action_retry_transfer can re-use it.
+        """
+        self._retry_remote_tmp  = data.get("remote_tmp", [])
+        self._retry_conn_params = data.get("conn_params", {})
+        self._retry_dump_path   = data.get("dump_path", "")
+        self._retry_inventory   = data.get("inventory")
+
+        error_msg = data.get("error", "")
+        if error_msg:
+            self._append_log(f"[ERROR] Error durante el traslado: {error_msg}")
+            self._set_status_op("✗ Fallo traslado", color="#C0392B")
+        messagebox.showerror(
+            APP_TITLE,
+            f"El traslado fallo:\n\n{error_msg}\n\n"
+            "Los archivos del servidor siguen disponibles.\n"
+            "Puede reintentar el traslado con el mismo u otro destino."
+        )
+
+        files_text = "\n".join(f"  • {f}" for f in self._retry_remote_tmp) or "(ninguno)"
+        self._lbl_retry_files.config(text=files_text)
+
+        # Grid the retry panel below the progress/button area (row 7)
+        self._frm_retry.grid(
+            row=7, column=0, columnspan=2, sticky="ew",
+            padx=0, pady=(_PAD, 0),
+        )
+        # Scroll to show it if the tab is in a scrollable frame
+        try:
+            self._frm_retry.update_idletasks()
+            self.nb.select(4)  # ensure Tab 5 is visible
+        except Exception:
+            pass
+
+    def _hide_retry_panel(self) -> None:
+        """Hide the retry panel and clear stored retry state."""
+        self._frm_retry.grid_remove()
+        self._retry_remote_tmp  = []
+        self._retry_conn_params = {}
+        self._retry_dump_path   = ""
+        self._retry_inventory   = None
+
+    def _action_retry_transfer(self) -> None:
+        """
+        Re-run only the transfer step using current Tab 4 destination settings.
+
+        The dump / filestore files already exist on the server — only the transfer
+        (and subsequent cleanup + inventory) is repeated.
+        """
+        if not self._retry_remote_tmp:
+            messagebox.showwarning(APP_TITLE, "No hay archivos pendientes de traslado.")
+            return
+
+        # Rebuild params: keep connection info from the original run, but override
+        # destination with whatever is currently selected in Tab 4.
+        p = dict(self._retry_conn_params)
+        p["dest_type"] = self._v_dest_type.get()
+        p["local_dir"] = self._v_local_dir.get()
+
+        if p["dest_type"] == "remote":
+            p["dest_host"] = self._dv["host"].get()
+            p["dest_port"] = self._dv["port"].get()
+            p["dest_user"] = self._dv["user"].get()
+            p["dest_pass"] = self._dv["pass"].get()
+            p["dest_dir"]  = self._dv["dir"].get()
+        elif p["dest_type"] == "gdrive":
+            p["gdrive_creds"]  = self._v_gdrive_creds.get()
+            p["gdrive_folder"] = self._v_gdrive_folder.get()
+
+        # Snapshot retry state BEFORE _hide_retry_panel clears it
+        remote_tmp    = list(self._retry_remote_tmp)
+        dump_path_ret = self._retry_dump_path
+        inventory_ret = self._retry_inventory
+
+        self._hide_retry_panel()
+        self._btn_run.config(state="disabled")
+        self._v_progress.set(0)
+        self._lbl_progress.config(text="")
+        self._begin_operation()
+
+        threading.Thread(
+            target=self._worker_transfer_only,
+            args=(p, remote_tmp, dump_path_ret, inventory_ret),
+            daemon=True,
+        ).start()
+
+    def _action_cleanup_server_retry(self) -> None:
+        """Delete the pending server temp files and close the retry panel."""
+        if not self._retry_remote_tmp:
+            self._hide_retry_panel()
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "Esto eliminará los archivos del servidor sin transferirlos:\n\n"
+            + "\n".join(f"  • {f}" for f in self._retry_remote_tmp)
+            + "\n\n¿Continuar?",
+        ):
+            return
+
+        db_mgr = DBManager(self._ssh)
+        for path in self._retry_remote_tmp:
+            try:
+                self._log(f"Limpiando {path} del servidor ...")
+                db_mgr.cleanup_remote(path)
+            except Exception as exc:
+                self._log(f"[aviso] No se pudo limpiar {path}: {exc}")
+
+        self._hide_retry_panel()
+        self._log("Archivos del servidor eliminados.")
+
+    def _worker_transfer_only(
+        self,
+        p: dict,
+        remote_tmp: list[str],
+        dump_path: str,
+        inventory: dict | None,
+    ) -> None:
+        """
+        Background worker that runs only the transfer step (Steps 3-5).
+
+        Used by the retry flow when files are already on the server and only
+        the destination needs to be re-attempted.
+        """
+        n    = max(len(remote_tmp), 1)
+        step = [0]
+
+        def advance_fn(label: str) -> None:
+            step[0] += 1
+            pct = min(int(step[0] / n * 90), 90)
+            self._q.put(("progress", (pct, label)))
+
+        try:
+            self._exec_transfer_and_finish(p, remote_tmp, dump_path, inventory, advance_fn)
+
+        except RuntimeError as exc:
+            if str(exc) == "__CANCELLED__":
+                self._q.put(("cancelled", "Traslado detenido por el usuario."))
+            else:
+                self._q.put(("transfer_failed", {
+                    "remote_tmp":  remote_tmp,
+                    "dump_path":   dump_path,
+                    "inventory":   inventory,
+                    "conn_params": p,
+                    "error":       str(exc),
+                }))
+                self._q.put(("btn_enable", None))
+        except Exception as exc:
+            self._q.put(("transfer_failed", {
+                "remote_tmp":  remote_tmp,
+                "dump_path":   dump_path,
+                "inventory":   inventory,
+                "conn_params": p,
+                "error":       str(exc),
+            }))
+            self._q.put(("btn_enable", None))
+
     # ── Shared helper ────────────────────────────────────────────────────
 
     def _scrollable_tab(self, tab_text: str) -> ttk.Frame:
@@ -1371,6 +1540,81 @@ class BackupApp:
             style="Stop.TButton", command=self._action_stop,
         )
         self._btn_stop_backup.pack(side="left", padx=6)
+
+        # ── Retry panel (hidden; shown when a transfer fails after files are ready) ──
+        self._frm_retry = tk.LabelFrame(
+            f, text="  Reanudar traslado  ",
+            font=("Segoe UI", 9, "bold"),
+            bg="#FFF3CD", fg="#664D03",
+            bd=1, relief="solid", padx=10, pady=8,
+        )
+        # Not gridded yet — _show_retry_panel() calls grid() when needed.
+
+        tk.Label(
+            self._frm_retry,
+            text="⚠  El traslado fallo pero los archivos siguen disponibles en el servidor.",
+            font=("Segoe UI", 9, "bold"),
+            bg="#FFF3CD", fg="#664D03",
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        tk.Label(
+            self._frm_retry,
+            text="Archivos listos:",
+            font=("Segoe UI", 8),
+            bg="#FFF3CD", fg="#664D03",
+        ).grid(row=1, column=0, sticky="nw", padx=(0, 6))
+
+        self._lbl_retry_files = tk.Label(
+            self._frm_retry,
+            text="",
+            font=("Consolas", 8),
+            bg="#FFF3CD", fg="#3D2B02",
+            justify="left", anchor="w",
+        )
+        self._lbl_retry_files.grid(row=1, column=1, sticky="w")
+
+        tk.Label(
+            self._frm_retry,
+            text="Cambia el destino en Tab 4 si lo necesitas, luego haz clic en Reintentar.",
+            font=("Segoe UI", 8, "italic"),
+            bg="#FFF3CD", fg="#664D03",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 4))
+
+        retry_btns = tk.Frame(self._frm_retry, bg="#FFF3CD")
+        retry_btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        tk.Button(
+            retry_btns,
+            text=" ↺  Reintentar traslado ",
+            font=("Segoe UI", 9, "bold"),
+            bg="#664D03", fg="white",
+            activebackground="#3D2B02", activeforeground="white",
+            relief="flat", cursor="hand2", padx=8, pady=4,
+            command=self._action_retry_transfer,
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            retry_btns,
+            text=" ⇆  Ir a Tab 4 (cambiar destino) ",
+            font=("Segoe UI", 9),
+            bg="#856404", fg="white",
+            activebackground="#664D03", activeforeground="white",
+            relief="flat", cursor="hand2", padx=8, pady=4,
+            command=lambda: self.nb.select(3),
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            retry_btns,
+            text=" ✕  Limpiar archivos del servidor ",
+            font=("Segoe UI", 9),
+            bg="#6c757d", fg="white",
+            activebackground="#495057", activeforeground="white",
+            relief="flat", cursor="hand2", padx=8, pady=4,
+            command=self._action_cleanup_server_retry,
+        ).pack(side="left")
+
+        self._frm_retry.columnconfigure(1, weight=1)
 
         f.columnconfigure(0, weight=1)
 
@@ -2071,7 +2315,9 @@ class BackupApp:
         remote_tmp: list[str] = []
         inventory: dict | None = None
         final_dump_fname: str = ""   # resolved after overwrite dialog
+        dump_path: str = ""          # set only when inc_db=True
 
+        # ── Phase A: create files on the server (not retryable) ──────────
         try:
             # ── 0. Collect inventory BEFORE dump starts ───────────────────
             # Read-only queries — safe while Odoo is still running.
@@ -2142,164 +2388,195 @@ class BackupApp:
                 remote_tmp.append(fs_path)
                 advance(f"Filestore comprimido: {fs_path}")
 
-            # ── 3. Transfer each file
-            # For Google Drive: a shared DriveUploader is built once per backup run.
-            gdrive_uploader = (
-                DriveUploader(p["gdrive_creds"], p["gdrive_folder"])
-                if p["dest_type"] == "gdrive"
-                else None
-            )
+        except RuntimeError as exc:
+            if str(exc) == "__CANCELLED__":
+                self._q.put(("cancelled", "Backup detenido por el usuario."))
+            else:
+                self._q.put(("error", f"Error creando backup: {exc}"))
+                self._q.put(("btn_enable", None))
+            return
+        except Exception as exc:
+            self._q.put(("error", f"Error creando backup: {exc}"))
+            self._q.put(("btn_enable", None))
+            return
 
-            for remote_file in remote_tmp:
-                fname = os.path.basename(remote_file)
-
-                if p["dest_type"] == "local":
-                    # Check if file already exists locally before downloading
-                    if transfer.local_file_exists(p["local_dir"], fname):
-                        action, fname = self._ask_overwrite(fname, p["local_dir"])
-                        if action == "cancel":
-                            self._log("Backup cancelado por el usuario.")
-                            self._q.put(("btn_enable", None))
-                            return
-
-                    def _prog(transferred: int, total: int, _f: str = fname) -> None:
-                        pct = (transferred / total * 100) if total else 0
-                        self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
-
-                    transfer.download_to_local(
-                        remote_file, p["local_dir"],
-                        dest_filename=fname,
-                        progress_callback=_prog,
-                        log_callback=self._log,
-                    )
-
-                elif p["dest_type"] == "remote":
-                    # Check if file already exists on the remote destination
-                    if transfer.remote_file_exists(
-                        p["dest_host"], int(p["dest_port"]),
-                        p["dest_user"], p["dest_pass"],
-                        p["dest_dir"], fname,
-                    ):
-                        action, fname = self._ask_overwrite(
-                            fname, f"{p['dest_host']}:{p['dest_dir']}"
-                        )
-                        if action == "cancel":
-                            self._log("Backup cancelado por el usuario.")
-                            self._q.put(("btn_enable", None))
-                            return
-
-                    transfer.transfer_to_server(
-                        remote_file,
-                        p["dest_host"],
-                        int(p["dest_port"]),
-                        p["dest_user"],
-                        p["dest_pass"],
-                        p["dest_dir"],
-                        dest_filename=fname,
-                        log_callback=self._log,
-                    )
-
-                else:
-                    # ── Google Drive: download to local temp, then upload to Drive ──
-                    # The tool never stores the file permanently on the local machine;
-                    # the temp file is deleted as soon as the Drive upload finishes.
-                    tmp_dir = tempfile.mkdtemp(prefix="odoo_bkp_drive_")
-                    try:
-                        def _prog_dl(transferred: int, total: int, _f: str = fname) -> None:
-                            pct = (transferred / total * 100) if total else 0
-                            self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
-
-                        local_tmp = transfer.download_to_local(
-                            remote_file, tmp_dir,
-                            dest_filename=fname,
-                            progress_callback=_prog_dl,
-                            log_callback=self._log,
-                        )
-
-                        def _prog_up(uploaded: int, total: int, _f: str = fname) -> None:
-                            pct = (uploaded / total * 100) if total else 0
-                            self._q.put(("progress", (pct, f"Subiendo {_f} a Drive ... {pct:.0f}%")))
-
-                        gdrive_uploader.upload_file(
-                            local_tmp,
-                            dest_filename=fname,
-                            progress_callback=_prog_up,
-                            log_callback=self._log,
-                        )
-                    finally:
-                        # Always clean up the local temp file
-                        try:
-                            if os.path.exists(os.path.join(tmp_dir, fname)):
-                                os.remove(os.path.join(tmp_dir, fname))
-                            os.rmdir(tmp_dir)
-                        except OSError:
-                            pass
-
-                # Update final_dump_fname with the resolved name AFTER the overwrite
-                # dialog — fname may have been renamed with a timestamp at this point.
-                # This ensures the companion inventory is saved with the same name
-                # as the actual dump file on disk so auto-detect can find it.
-                if remote_file == dump_path:
-                    final_dump_fname = fname
-
-                advance(f"Transferido: {fname}")
-
-            # ── 4. Remote cleanup
-            if p["cleanup"]:
-                for remote_file in remote_tmp:
-                    self._log(f"Limpiando {remote_file} del servidor ...")
-                    db_mgr.cleanup_remote(remote_file)
-
-            # ── 5. Save inventory alongside the backup files ──────────────
-            # The inventory JSON acts as a validation baseline for future restores.
-            # Naming: {dump_base}_inventory.json  (paired with the dump filename).
-            if inventory and final_dump_fname:
-                inv_base = os.path.splitext(final_dump_fname)[0]
-                inv_filename = f"{inv_base}_inventory.json"
-                try:
-                    if p["dest_type"] == "local":
-                        # Save next to the downloaded dump files
-                        inv_local = os.path.join(p["local_dir"], inv_filename)
-                        InventoryManager.save(inventory, inv_local)
-                        self._log(f"Inventario guardado: {inv_local}")
-                    elif p["dest_type"] == "gdrive":
-                        # Save locally first, then upload to Drive alongside the backup
-                        inv_local = os.path.join(
-                            InventoryManager.local_inventory_dir(), inv_filename
-                        )
-                        InventoryManager.save(inventory, inv_local)
-                        self._log(f"Inventario guardado localmente: {inv_local}")
-                        try:
-                            gdrive_uploader.upload_file(
-                                inv_local,
-                                dest_filename=inv_filename,
-                                log_callback=self._log,
-                            )
-                        except Exception as exc_inv:
-                            self._log(f"[aviso] No se pudo subir el inventario a Drive: {exc_inv}")
-                    else:
-                        # For remote destinations, keep a local copy in the
-                        # inventories folder so the user can find it later
-                        # when selecting the restore source from this machine.
-                        inv_local = os.path.join(
-                            InventoryManager.local_inventory_dir(), inv_filename
-                        )
-                        InventoryManager.save(inventory, inv_local)
-                        self._log(f"Inventario guardado localmente: {inv_local}")
-                except Exception as exc:
-                    self._log(f"[aviso] No se pudo guardar el inventario: {exc}")
-
-            self._q.put(("done", "Backup completado exitosamente."))
+        # ── Phase B: transfer (retryable — files are on the server) ─────
+        # Any error here shows the retry panel so the user can change the
+        # destination and re-run the transfer without recreating the dump/zip.
+        try:
+            self._exec_transfer_and_finish(p, remote_tmp, dump_path, inventory, advance)
 
         except RuntimeError as exc:
             if str(exc) == "__CANCELLED__":
                 self._q.put(("cancelled", "Backup detenido por el usuario."))
             else:
-                self._q.put(("error", f"Error durante el backup: {exc}"))
+                self._q.put(("transfer_failed", {
+                    "remote_tmp": list(remote_tmp),
+                    "dump_path":  dump_path,
+                    "inventory":  inventory,
+                    "conn_params": p,
+                    "error": str(exc),
+                }))
                 self._q.put(("btn_enable", None))
         except Exception as exc:
-            self._q.put(("error", f"Error durante el backup: {exc}"))
+            self._q.put(("transfer_failed", {
+                "remote_tmp":  list(remote_tmp),
+                "dump_path":   dump_path,
+                "inventory":   inventory,
+                "conn_params": p,
+                "error":       str(exc),
+            }))
             self._q.put(("btn_enable", None))
+
+    def _exec_transfer_and_finish(
+        self,
+        p: dict,
+        remote_tmp: list[str],
+        dump_path: str,
+        inventory: dict | None,
+        advance_fn,
+    ) -> None:
+        """
+        Steps 3-5: transfer files to destination, server cleanup, save inventory.
+
+        Raises RuntimeError / Exception on failure — callers wrap this in try/except
+        and decide whether to show the retry panel or report a fatal error.
+
+        Args:
+            p:           Full backup params dict (dest_type, connection info, etc.).
+            remote_tmp:  List of absolute paths on the source server ready to transfer.
+            dump_path:   Path of the DB dump on the server (used to name the inventory).
+            inventory:   Inventory dict collected before the dump, or None.
+            advance_fn:  Callable(label) that increments the progress bar step counter.
+        """
+        db_mgr   = DBManager(self._ssh)
+        transfer = TransferManager(self._ssh)
+
+        # ── 3. Transfer each file ─────────────────────────────────────────
+        final_dump_fname: str = ""
+        gdrive_uploader = (
+            DriveUploader(p["gdrive_creds"], p["gdrive_folder"])
+            if p["dest_type"] == "gdrive"
+            else None
+        )
+
+        for remote_file in remote_tmp:
+            fname = os.path.basename(remote_file)
+
+            if p["dest_type"] == "local":
+                if transfer.local_file_exists(p["local_dir"], fname):
+                    action, fname = self._ask_overwrite(fname, p["local_dir"])
+                    if action == "cancel":
+                        self._log("Backup cancelado por el usuario.")
+                        self._q.put(("btn_enable", None))
+                        return
+
+                def _prog(transferred: int, total: int, _f: str = fname) -> None:
+                    pct = (transferred / total * 100) if total else 0
+                    self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
+
+                transfer.download_to_local(
+                    remote_file, p["local_dir"],
+                    dest_filename=fname,
+                    progress_callback=_prog,
+                    log_callback=self._log,
+                )
+
+            elif p["dest_type"] == "remote":
+                if transfer.remote_file_exists(
+                    p["dest_host"], int(p["dest_port"]),
+                    p["dest_user"], p["dest_pass"],
+                    p["dest_dir"], fname,
+                ):
+                    action, fname = self._ask_overwrite(
+                        fname, f"{p['dest_host']}:{p['dest_dir']}"
+                    )
+                    if action == "cancel":
+                        self._log("Backup cancelado por el usuario.")
+                        self._q.put(("btn_enable", None))
+                        return
+
+                transfer.transfer_to_server(
+                    remote_file,
+                    p["dest_host"],
+                    int(p["dest_port"]),
+                    p["dest_user"],
+                    p["dest_pass"],
+                    p["dest_dir"],
+                    dest_filename=fname,
+                    log_callback=self._log,
+                )
+
+            else:
+                # ── Google Drive: stream directly SFTP → Drive (no local disk) ──
+                total_size = transfer.get_remote_file_size(remote_file)
+                sftp_session, sftp_file = transfer.open_remote_file(remote_file)
+                try:
+                    def _prog_up(uploaded: int, total: int, _f: str = fname) -> None:
+                        pct = (uploaded / total * 100) if total else 0
+                        self._q.put(("progress", (pct, f"Drive streaming {_f} ... {pct:.0f}%")))
+
+                    gdrive_uploader.upload_stream(
+                        sftp_file,
+                        filename=fname,
+                        total_size=total_size,
+                        progress_callback=_prog_up,
+                        log_callback=self._log,
+                    )
+                finally:
+                    try:
+                        sftp_file.close()
+                    except Exception:
+                        pass
+                    try:
+                        sftp_session.close()
+                    except Exception:
+                        pass
+
+            if remote_file == dump_path:
+                final_dump_fname = fname
+
+            advance_fn(f"Transferido: {fname}")
+
+        # ── 4. Remote cleanup ─────────────────────────────────────────────
+        if p.get("cleanup", True):
+            for remote_file in remote_tmp:
+                self._log(f"Limpiando {remote_file} del servidor ...")
+                db_mgr.cleanup_remote(remote_file)
+
+        # ── 5. Save inventory ─────────────────────────────────────────────
+        if inventory and final_dump_fname:
+            inv_base     = os.path.splitext(final_dump_fname)[0]
+            inv_filename = f"{inv_base}_inventory.json"
+            try:
+                if p["dest_type"] == "local":
+                    inv_local = os.path.join(p["local_dir"], inv_filename)
+                    InventoryManager.save(inventory, inv_local)
+                    self._log(f"Inventario guardado: {inv_local}")
+                elif p["dest_type"] == "gdrive":
+                    inv_local = os.path.join(
+                        InventoryManager.local_inventory_dir(), inv_filename
+                    )
+                    InventoryManager.save(inventory, inv_local)
+                    self._log(f"Inventario guardado localmente: {inv_local}")
+                    try:
+                        gdrive_uploader.upload_file(
+                            inv_local,
+                            dest_filename=inv_filename,
+                            log_callback=self._log,
+                        )
+                    except Exception as exc_inv:
+                        self._log(f"[aviso] No se pudo subir el inventario a Drive: {exc_inv}")
+                else:
+                    inv_local = os.path.join(
+                        InventoryManager.local_inventory_dir(), inv_filename
+                    )
+                    InventoryManager.save(inventory, inv_local)
+                    self._log(f"Inventario guardado localmente: {inv_local}")
+            except Exception as exc:
+                self._log(f"[aviso] No se pudo guardar el inventario: {exc}")
+
+        self._q.put(("done", "Backup completado exitosamente."))
 
     def _action_stop(self) -> None:
         """Signal the running backup, restore, or addons-sync to stop."""
@@ -2445,6 +2722,9 @@ class BackupApp:
 
                 elif event == "btn_enable":
                     self._btn_run.config(state="normal")
+
+                elif event == "transfer_failed":
+                    self._show_retry_panel(data)
 
                 elif event == "ask_overwrite":
                     filename, dest_desc, ev, result = data
