@@ -3285,11 +3285,6 @@ class BackupApp:
                 elif event == "sched_log":
                     rule_id, message = data
                     self._append_log(message)
-                    # Also update the automation tab log if it exists
-                    try:
-                        self._sched_append_log(message)
-                    except Exception:
-                        pass
 
         except queue.Empty:
             pass
@@ -5683,25 +5678,6 @@ class BackupApp:
             command=self._sched_run_now,
         ).pack(side="left", padx=4)
 
-        # ── Scheduler log ─────────────────────────────────────────────────
-        lf_log = ttk.LabelFrame(outer, text="Log del programador", padding=_PAD)
-        lf_log.grid(row=3, column=0, sticky="ew", padx=_PAD, pady=(0, _PAD))
-        lf_log.columnconfigure(0, weight=1)
-
-        self._sched_log_text = tk.Text(
-            lf_log,
-            height=6,
-            state="disabled",
-            wrap="word",
-            font=("Consolas", 8),
-            bg=_LOG_BG,
-            fg=_LOG_FG,
-        )
-        self._sched_log_text.grid(row=0, column=0, sticky="ew")
-        sb_log = ttk.Scrollbar(lf_log, orient="vertical", command=self._sched_log_text.yview)
-        sb_log.grid(row=0, column=1, sticky="ns")
-        self._sched_log_text.configure(yscrollcommand=sb_log.set)
-
         # Populate tree on first display
         self._sched_refresh_tree(self._sched_mgr.list_rules())
 
@@ -5752,19 +5728,6 @@ class BackupApp:
                         next_str, result_display),
                 tags=(tag,),
             )
-
-    def _sched_append_log(self, message: str) -> None:
-        """Append a line to the scheduler log widget (GUI thread only)."""
-        try:
-            w = self._sched_log_text
-        except AttributeError:
-            return
-        import datetime as _dt_mod
-        ts = _dt_mod.datetime.now().strftime("%H:%M:%S")
-        w.config(state="normal")
-        w.insert("end", f"[{ts}]  {message}\n")
-        w.see("end")
-        w.config(state="disabled")
 
     def _sched_toggle_pause(self) -> None:
         """Toggle the scheduler between paused and active states."""
