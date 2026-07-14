@@ -2141,20 +2141,32 @@ class BackupApp:
             self._v_prof_gdrive_folder.set(p.get("gdrive_folder_id", ""))
 
     def _save_profile(self) -> None:
-        """Save current Tab-1 connection fields as a named profile."""
+        """Save current Tab-1 connection fields as a named profile.
+
+        If a profile is already selected, updates it directly (no name prompt).
+        If nothing is selected, asks for a name to create a new profile.
+        """
         host = self._cv["host"].get().strip()
         if not host:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
-        default_name = f"{self._cv['user'].get()}@{host}:{self._cv['port'].get()}"
-        name = simpledialog.askstring(
-            "Guardar perfil",
-            "Nombre del perfil:",
-            initialvalue=self._cb_profile.get() or default_name,
-            parent=self.root,
-        )
-        if not name:
-            return
+        existing = self._cb_profile.get()
+        if existing:
+            # Editing an existing profile — confirm and overwrite directly
+            if not messagebox.askyesno(
+                APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
+            ):
+                return
+            name = existing
+        else:
+            # New profile — ask for a name
+            default_name = f"{self._cv['user'].get()}@{host}:{self._cv['port'].get()}"
+            name = simpledialog.askstring(
+                "Nuevo perfil", "Nombre del perfil:",
+                initialvalue=default_name, parent=self.root,
+            )
+            if not name:
+                return
         try:
             self._profiles.save(
                 name=name,
@@ -2197,20 +2209,29 @@ class BackupApp:
             # Keep 'dir' as-is — it's specific to backup paths, not the server profile
 
     def _save_d_profile(self) -> None:
-        """Save current Tab-4 destination fields as a named profile."""
+        """Save current Tab-4 destination fields as a named profile.
+
+        Updates the selected profile directly; asks for name only when creating new.
+        """
         host = self._dv["host"].get().strip()
         if not host:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
-        default_name = f"{self._dv['user'].get()}@{host}:{self._dv['port'].get()}"
-        name = simpledialog.askstring(
-            "Guardar perfil",
-            "Nombre del perfil:",
-            initialvalue=self._cb_d_profile.get() or default_name,
-            parent=self.root,
-        )
-        if not name:
-            return
+        existing = self._cb_d_profile.get()
+        if existing:
+            if not messagebox.askyesno(
+                APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
+            ):
+                return
+            name = existing
+        else:
+            default_name = f"{self._dv['user'].get()}@{host}:{self._dv['port'].get()}"
+            name = simpledialog.askstring(
+                "Nuevo perfil", "Nombre del perfil:",
+                initialvalue=default_name, parent=self.root,
+            )
+            if not name:
+                return
         try:
             self._profiles.save(
                 name=name,
@@ -2250,23 +2271,32 @@ class BackupApp:
             self._r_conn_vars["pass"].set(p["password"])
 
     def _save_r_profile(self) -> None:
-        """Save current restore 'otro servidor' fields as a named profile."""
+        """Save current restore 'otro servidor' fields as a named profile.
+
+        Updates the selected profile directly; asks for name only when creating new.
+        """
         host = self._r_conn_vars["host"].get().strip()
         if not host:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
-        default_name = (
-            f"{self._r_conn_vars['user'].get()}@{host}:"
-            f"{self._r_conn_vars['port'].get()}"
-        )
-        name = simpledialog.askstring(
-            "Guardar perfil",
-            "Nombre del perfil:",
-            initialvalue=self._cb_r_profile.get() or default_name,
-            parent=self.root,
-        )
-        if not name:
-            return
+        existing = self._cb_r_profile.get()
+        if existing:
+            if not messagebox.askyesno(
+                APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
+            ):
+                return
+            name = existing
+        else:
+            default_name = (
+                f"{self._r_conn_vars['user'].get()}@{host}:"
+                f"{self._r_conn_vars['port'].get()}"
+            )
+            name = simpledialog.askstring(
+                "Nuevo perfil", "Nombre del perfil:",
+                initialvalue=default_name, parent=self.root,
+            )
+            if not name:
+                return
         try:
             self._profiles.save(
                 name=name,
