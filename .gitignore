@@ -1,23 +1,17 @@
-# ── Build output ─────────────────────────────────────────────────────────────
+# Build artifacts
 output/
 
-# ── PyInstaller legacy (in case pyinstaller is run without --distpath) ────────
-dist/
-build/
-*.spec.bak
+# Google Service Account credentials — NEVER commit these
+*.json
 
-# ── Python cache ──────────────────────────────────────────────────────────────
+# Temp icon files
+__icon.ico
+
+# Python cache
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 
-# ── Runtime / tool artifacts ──────────────────────────────────────────────────
-*.log
-.logs/
-
-# ── Editor / OS ───────────────────────────────────────────────────────────────
-.vscode/
-.idea/
-*.swp
-Thumbs.db
-.DS_Store
+# PyInstaller
+build/
+dist/

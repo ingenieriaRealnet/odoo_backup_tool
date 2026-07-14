@@ -35,6 +35,11 @@ pyinstaller ^
     --hidden-import cryptography ^
     --hidden-import PIL ^
     --hidden-import PIL.Image ^
+    --hidden-import google.oauth2.service_account ^
+    --hidden-import google.auth.transport.requests ^
+    --hidden-import googleapiclient.discovery ^
+    --hidden-import googleapiclient.http ^
+    --hidden-import googleapiclient.errors ^
     --add-data "icon.ico;." ^
     main.py
 
