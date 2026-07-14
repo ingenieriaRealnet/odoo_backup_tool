@@ -5710,7 +5710,10 @@ class BackupApp:
             tree = self._sched_tree
         except AttributeError:
             return
-        tree.delete(*tree.get_children())
+        # Guard: tree.delete() with no args raises TclError ("root item may not be deleted")
+        children = tree.get_children()
+        if children:
+            tree.delete(*children)
         for i, r in enumerate(rules, 1):
             label      = r.get("label") or r.get("db_name", "—")
             db_name    = r.get("db_name", "")
@@ -5787,6 +5790,11 @@ class BackupApp:
         dlg = _ScheduleDialog(self.root, self._profiles, None)
         result = dlg.show()
         if result:
+            # Set last_run_ts to today so the rule does not fire immediately after
+            # creation; it will first execute at the next scheduled time (tomorrow
+            # at the earliest). The user can trigger an on-demand run via
+            # "Ejecutar ahora" if needed.
+            result["last_run_ts"] = datetime.datetime.now().isoformat(timespec="seconds")
             self._sched_mgr.add(result)
             self._sched_refresh_tree(self._sched_mgr.list_rules())
 
