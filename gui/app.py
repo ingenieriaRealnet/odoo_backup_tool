@@ -191,7 +191,8 @@ class _ScheduleDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("Regla de backup" if rule is None else "Editar regla de backup")
         self.resizable(True, True)
-        self.grab_set()
+        # No grab_set() — diálogo no modal para que el usuario pueda consultar
+        # otros tabs de la herramienta mientras llena los campos de la regla.
         self.focus_set()
 
         self._profile_mgr = profile_mgr
