@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 # ── Optional dependency guard ─────────────────────────────────────────────────
@@ -284,6 +285,96 @@ class DriveUploader:
         if log_callback:
             log_callback(f"Subida completa a Drive: {filename} (id={file_id})")
         return file_id
+
+    def cleanup_old_files(
+        self,
+        name_prefix: str,
+        retention_days: int,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> int:
+        """
+        Delete Drive files whose name starts with name_prefix and whose
+        createdTime is older than retention_days days.
+
+        Only files directly inside the configured folder are considered —
+        subfolders are not recursed.
+
+        Args:
+            name_prefix:    Filename prefix to filter by (e.g. "odoo_bancasa_prod_").
+            retention_days: Files older than this many days are deleted.
+            log_callback:   Optional status logger.
+
+        Returns:
+            Number of files deleted.
+        """
+        if retention_days <= 0:
+            return 0
+
+        folder_id  = self._resolve_target_folder()
+        svc        = self._get_service()
+        cutoff     = datetime.now(tz=timezone.utc) - timedelta(days=retention_days)
+        deleted    = 0
+
+        # Escape single quotes in prefix for the query string
+        safe_prefix = name_prefix.replace("'", "\\'")
+
+        # List all non-trashed files in the folder whose name starts with the prefix.
+        # Drive's `contains` operator is a substring match, so we filter by startswith
+        # in Python after fetching.
+        page_token = None
+        while True:
+            params: dict = {
+                "q": (
+                    f"'{folder_id}' in parents "
+                    f"and name contains '{safe_prefix}' "
+                    "and trashed=false "
+                    "and mimeType != 'application/vnd.google-apps.folder'"
+                ),
+                "includeItemsFromAllDrives": True,
+                "supportsAllDrives":         True,
+                "fields":                    "nextPageToken, files(id, name, createdTime)",
+                "pageSize":                  100,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            result    = svc.files().list(**params).execute()
+            files     = result.get("files", [])
+            page_token = result.get("nextPageToken")
+
+            for f in files:
+                if not f.get("name", "").startswith(name_prefix):
+                    continue
+                created_str = f.get("createdTime", "")
+                try:
+                    created = datetime.fromisoformat(
+                        created_str.replace("Z", "+00:00")
+                    )
+                except (ValueError, AttributeError):
+                    continue
+
+                if created < cutoff:
+                    try:
+                        svc.files().delete(
+                            fileId=f["id"],
+                            supportsAllDrives=True,
+                        ).execute()
+                        deleted += 1
+                        if log_callback:
+                            log_callback(
+                                f"  Retencion Drive: eliminado {f['name']} "
+                                f"(creado {created.date()})"
+                            )
+                    except HttpError as exc:
+                        if log_callback:
+                            log_callback(
+                                f"  [aviso] No se pudo eliminar {f['name']}: {exc}"
+                            )
+
+            if not page_token:
+                break
+
+        return deleted
 
     def upload_stream(
         self,

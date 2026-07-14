@@ -25,11 +25,13 @@ class ProfileManager:
     Manages a persistent list of SSH server connection profiles.
 
     Profile structure (per entry):
-        name (str)     — human-readable label shown in the UI dropdown
-        host (str)     — IP or hostname
-        port (int)     — SSH port (default 22)
-        user (str)     — SSH username
-        password (str) — SSH password (plain text)
+        name (str)             — human-readable label shown in the UI dropdown
+        host (str)             — IP or hostname
+        port (int)             — SSH port (default 22)
+        user (str)             — SSH username
+        password (str)         — SSH password (plain text)
+        gdrive_creds_path (str)  — optional: absolute path to Service Account JSON
+        gdrive_folder_id (str)   — optional: Google Drive folder or Shared Drive ID
     """
 
     def __init__(self) -> None:
@@ -66,11 +68,17 @@ class ProfileManager:
         Return the profile dict for the given name, or None if not found.
 
         Returns:
-            dict with keys: name, host, port, user, password
+            dict with keys: name, host, port, user, password,
+                            gdrive_creds_path, gdrive_folder_id
+            (gdrive fields default to "" for profiles saved before v1.2)
         """
         for p in self._profiles:
             if p["name"] == name:
-                return dict(p)
+                result = dict(p)
+                # Back-fill Drive fields for older profiles that lack them
+                result.setdefault("gdrive_creds_path", "")
+                result.setdefault("gdrive_folder_id", "")
+                return result
         return None
 
     def save(
@@ -80,6 +88,8 @@ class ProfileManager:
         port: int,
         user: str,
         password: str,
+        gdrive_creds_path: str = "",
+        gdrive_folder_id: str = "",
     ) -> None:
         """
         Save (create or update) a profile with the given name.
@@ -87,11 +97,13 @@ class ProfileManager:
         If a profile with the same name already exists it is overwritten.
 
         Args:
-            name: Human-readable label (shown in dropdowns).
-            host: IP or hostname.
-            port: SSH port.
-            user: SSH username.
-            password: SSH password.
+            name:               Human-readable label (shown in dropdowns).
+            host:               IP or hostname.
+            port:               SSH port.
+            user:               SSH username.
+            password:           SSH password.
+            gdrive_creds_path:  Optional path to Google Service Account JSON.
+            gdrive_folder_id:   Optional Drive folder or Shared Drive ID.
 
         Raises:
             ValueError: If name or host is empty.
@@ -104,11 +116,13 @@ class ProfileManager:
             raise ValueError("El host no puede estar vacio.")
 
         entry = {
-            "name": name,
-            "host": host,
-            "port": int(port),
-            "user": user.strip(),
-            "password": password,
+            "name":               name,
+            "host":               host,
+            "port":               int(port),
+            "user":               user.strip(),
+            "password":           password,
+            "gdrive_creds_path":  gdrive_creds_path.strip(),
+            "gdrive_folder_id":   gdrive_folder_id.strip(),
         }
 
         # Replace existing entry with same name, or append

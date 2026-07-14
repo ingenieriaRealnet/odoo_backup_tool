@@ -32,6 +32,7 @@ from gui.help_window import HelpWindow
 from gui.file_browser_panel import FileBrowserPanel
 from gui.ssh_terminal_panel import SshTerminalPanel
 from core.trial_manager import TrialManager
+from core.scheduler import ScheduleManager, BackupScheduler
 
 def _add_timestamp(filename: str) -> str:
     """Insert a timestamp before the file extension: file.dump → file_2026-06-25_14-03.dump"""
@@ -175,6 +176,307 @@ _C_RED      = "#C0392B"   # Stop/danger
 _C_RED2     = "#E74C3C"   # Stop hover
 
 
+class _ScheduleDialog(tk.Toplevel):
+    """
+    Modal dialog for creating or editing a scheduled-backup rule.
+
+    Args:
+        parent:       Parent Tk window.
+        profile_mgr:  ProfileManager instance (to populate server dropdown).
+        rule:         Existing rule dict to edit, or None to create a new one.
+    """
+
+    def __init__(self, parent, profile_mgr, rule: dict | None) -> None:
+        super().__init__(parent)
+        self.title("Regla de backup" if rule is None else "Editar regla de backup")
+        self.resizable(True, True)
+        self.grab_set()
+        self.focus_set()
+
+        self._profile_mgr = profile_mgr
+        self._result: dict | None = None
+
+        # Pre-fill from rule or use defaults
+        r = rule or {}
+        _PAD = 8
+
+        # ── Variables ─────────────────────────────────────────────────────
+        self._v_label        = tk.StringVar(value=r.get("label", ""))
+        self._v_server       = tk.StringVar(value=r.get("server_profile", ""))
+        self._v_db_name      = tk.StringVar(value=r.get("db_name", ""))
+        self._v_db_fmt       = tk.StringVar(value=r.get("db_format", "dump"))
+        self._v_inc_db       = tk.BooleanVar(value=r.get("include_db", True))
+        self._v_inc_fs       = tk.BooleanVar(value=r.get("include_filestore", True))
+        self._v_fs_root      = tk.StringVar(value=r.get("filestore_root", ""))
+        self._v_fs_db        = tk.StringVar(value=r.get("filestore_db", ""))
+        self._v_dest_type    = tk.StringVar(value=r.get("dest_type", "gdrive"))
+        self._v_local_dir    = tk.StringVar(value=r.get("dest_local_dir", ""))
+        self._v_rem_profile  = tk.StringVar(value=r.get("dest_remote_profile", ""))
+        self._v_rem_dir      = tk.StringVar(value=r.get("dest_remote_dir", "/opt/backups"))
+        self._v_gdrive_creds = tk.StringVar(value=r.get("dest_gdrive_creds", ""))
+        self._v_gdrive_folder= tk.StringVar(value=r.get("dest_gdrive_folder_id", ""))
+        self._v_hour         = tk.StringVar(value=str(r.get("schedule_hour", 2)))
+        self._v_minute       = tk.StringVar(value=str(r.get("schedule_minute", 0)))
+        self._v_retention    = tk.StringVar(value=str(r.get("retention_days", 90)))
+        self._v_cleanup      = tk.BooleanVar(value=r.get("cleanup_server", True))
+        self._v_enabled      = tk.BooleanVar(value=r.get("enabled", True))
+
+        # ── Layout ────────────────────────────────────────────────────────
+        self.columnconfigure(0, weight=1)
+        content = ttk.Frame(self, padding=_PAD)
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        row = 0
+
+        # Nombre
+        ttk.Label(content, text="Nombre de la regla:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_label).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        # Habilitado
+        ttk.Checkbutton(content, text="Regla habilitada", variable=self._v_enabled).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=4
+        )
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Servidor
+        ttk.Label(content, text="Servidor (perfil):", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        ttk.Label(content, text="Perfil SSH:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        self._cb_server = ttk.Combobox(
+            content, textvariable=self._v_server,
+            values=profile_mgr.names(), state="readonly",
+        )
+        self._cb_server.grid(row=row, column=1, sticky="ew", pady=4)
+        self._cb_server.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Base de datos
+        ttk.Label(content, text="Base de datos:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        ttk.Label(content, text="Nombre de la BD:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_db_name).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+        ttk.Label(content, text="Formato:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        fmt_frame = ttk.Frame(content)
+        fmt_frame.grid(row=row, column=1, sticky="w")
+        ttk.Radiobutton(fmt_frame, text=".dump (recomendado)", variable=self._v_db_fmt, value="dump").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(fmt_frame, text=".sql (texto plano)", variable=self._v_db_fmt, value="sql").pack(side="left")
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Filestore
+        ttk.Label(content, text="Filestore:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        ttk.Checkbutton(content, text="Incluir dump de BD", variable=self._v_inc_db).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=2
+        )
+        row += 1
+        ttk.Checkbutton(content, text="Incluir filestore", variable=self._v_inc_fs).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=2
+        )
+        row += 1
+        ttk.Label(content, text="Ruta raiz filestore:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_fs_root).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+        ttk.Label(content, text="Carpeta BD filestore:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_fs_db).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Destino
+        ttk.Label(content, text="Destino:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        dest_rb_frame = ttk.Frame(content)
+        dest_rb_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(dest_rb_frame, text="Google Drive", variable=self._v_dest_type, value="gdrive",
+                        command=self._toggle_dest).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(dest_rb_frame, text="Local", variable=self._v_dest_type, value="local",
+                        command=self._toggle_dest).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(dest_rb_frame, text="Otro servidor", variable=self._v_dest_type, value="remote",
+                        command=self._toggle_dest).pack(side="left")
+        row += 1
+
+        # Drive panel
+        self._pnl_gdrive = ttk.Frame(content)
+        self._pnl_gdrive.columnconfigure(1, weight=1)
+        ttk.Label(self._pnl_gdrive, text="Credenciales JSON:").grid(row=0, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        _gdrive_row = ttk.Frame(self._pnl_gdrive)
+        _gdrive_row.grid(row=0, column=1, sticky="ew")
+        _gdrive_row.columnconfigure(0, weight=1)
+        ttk.Entry(_gdrive_row, textvariable=self._v_gdrive_creds).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(_gdrive_row, text="...", width=3,
+                   command=lambda: self._v_gdrive_creds.set(
+                       filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("Todos", "*.*")]) or self._v_gdrive_creds.get()
+                   )).grid(row=0, column=1)
+        ttk.Label(self._pnl_gdrive, text="Carpeta Drive (ID):").grid(row=1, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(self._pnl_gdrive, textvariable=self._v_gdrive_folder).grid(row=1, column=1, sticky="ew", pady=4)
+
+        # Local panel
+        self._pnl_local = ttk.Frame(content)
+        self._pnl_local.columnconfigure(1, weight=1)
+        ttk.Label(self._pnl_local, text="Directorio local:").grid(row=0, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        _local_row = ttk.Frame(self._pnl_local)
+        _local_row.grid(row=0, column=1, sticky="ew")
+        _local_row.columnconfigure(0, weight=1)
+        ttk.Entry(_local_row, textvariable=self._v_local_dir).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(_local_row, text="...", width=3,
+                   command=lambda: self._v_local_dir.set(
+                       filedialog.askdirectory(title="Seleccionar directorio destino") or self._v_local_dir.get()
+                   )).grid(row=0, column=1)
+
+        # Remote panel
+        self._pnl_remote = ttk.Frame(content)
+        self._pnl_remote.columnconfigure(1, weight=1)
+        ttk.Label(self._pnl_remote, text="Perfil servidor:").grid(row=0, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Combobox(self._pnl_remote, textvariable=self._v_rem_profile,
+                     values=profile_mgr.names(), state="readonly").grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(self._pnl_remote, text="Directorio destino:").grid(row=1, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(self._pnl_remote, textvariable=self._v_rem_dir).grid(row=1, column=1, sticky="ew", pady=4)
+
+        self._dest_row = row
+        self._content = content
+        self._toggle_dest()
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Programacion
+        ttk.Label(content, text="Programacion:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        time_frame = ttk.Frame(content)
+        time_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Label(time_frame, text="Hora de ejecucion (HH MM):").pack(side="left", padx=(0, _PAD))
+        ttk.Spinbox(time_frame, textvariable=self._v_hour, from_=0, to=23, width=4, format="%02.0f").pack(side="left", padx=(0, 4))
+        ttk.Label(time_frame, text=":").pack(side="left")
+        ttk.Spinbox(time_frame, textvariable=self._v_minute, from_=0, to=59, width=4, format="%02.0f").pack(side="left", padx=(4, 0))
+        row += 1
+
+        ret_frame = ttk.Frame(content)
+        ret_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Label(ret_frame, text="Retener backups (dias, 0 = sin limite):").pack(side="left", padx=(0, _PAD))
+        ttk.Spinbox(ret_frame, textvariable=self._v_retention, from_=0, to=3650, width=6).pack(side="left")
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Opciones
+        ttk.Checkbutton(content, text="Limpiar /tmp/ del servidor al terminar", variable=self._v_cleanup).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=4
+        )
+        row += 1
+
+        # Buttons
+        btn_frame = ttk.Frame(self, padding=(_PAD, 0, _PAD, _PAD))
+        btn_frame.grid(row=1, column=0, sticky="ew")
+        ttk.Button(btn_frame, text="Guardar", style="Primary.TButton" if hasattr(ttk.Style(), "theme_use") else "TButton",
+                   command=self._save).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Cancelar", command=self.destroy).pack(side="right", padx=4)
+
+        self.update_idletasks()
+        px = parent.winfo_x() + max(0, (parent.winfo_width()  - self.winfo_width())  // 2)
+        py = parent.winfo_y() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
+        self.geometry(f"+{px}+{py}")
+
+    def _on_profile_selected(self, event=None) -> None:
+        """Auto-fill Drive credentials from the selected server profile."""
+        name = self._v_server.get()
+        p = self._profile_mgr.get(name)
+        if p:
+            if p.get("gdrive_creds_path") and not self._v_gdrive_creds.get():
+                self._v_gdrive_creds.set(p["gdrive_creds_path"])
+            if p.get("gdrive_folder_id") and not self._v_gdrive_folder.get():
+                self._v_gdrive_folder.set(p["gdrive_folder_id"])
+            # Auto-fill filestore root hint (user may need to adjust)
+            if not self._v_fs_root.get():
+                self._v_fs_root.set("/var/lib/odoo/filestore")
+
+    def _toggle_dest(self) -> None:
+        """Show/hide destination sub-panels based on the selected radio."""
+        dest = self._v_dest_type.get()
+        row  = self._dest_row
+        for pnl in (self._pnl_gdrive, self._pnl_local, self._pnl_remote):
+            pnl.grid_remove()
+        if dest == "gdrive":
+            self._pnl_gdrive.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0))
+        elif dest == "local":
+            self._pnl_local.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0))
+        else:
+            self._pnl_remote.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0))
+
+    def _save(self) -> None:
+        """Validate and collect the rule dict from dialog fields."""
+        label   = self._v_label.get().strip()
+        db_name = self._v_db_name.get().strip()
+        if not label:
+            messagebox.showwarning("Validacion", "Ingrese un nombre para la regla.", parent=self)
+            return
+        if not db_name:
+            messagebox.showwarning("Validacion", "Ingrese el nombre de la base de datos.", parent=self)
+            return
+        if not self._v_server.get():
+            messagebox.showwarning("Validacion", "Seleccione un perfil de servidor.", parent=self)
+            return
+        try:
+            hour   = int(self._v_hour.get())
+            minute = int(self._v_minute.get())
+        except ValueError:
+            messagebox.showwarning("Validacion", "Hora o minuto invalidos.", parent=self)
+            return
+
+        self._result = {
+            "label":                self._v_label.get().strip(),
+            "enabled":              self._v_enabled.get(),
+            "server_profile":       self._v_server.get(),
+            "db_name":              db_name,
+            "db_format":            self._v_db_fmt.get(),
+            "include_db":           self._v_inc_db.get(),
+            "include_filestore":    self._v_inc_fs.get(),
+            "filestore_root":       self._v_fs_root.get().strip(),
+            "filestore_db":         self._v_fs_db.get().strip() or db_name,
+            "dest_type":            self._v_dest_type.get(),
+            "dest_local_dir":       self._v_local_dir.get().strip(),
+            "dest_remote_profile":  self._v_rem_profile.get(),
+            "dest_remote_dir":      self._v_rem_dir.get().strip(),
+            "dest_gdrive_creds":    self._v_gdrive_creds.get().strip(),
+            "dest_gdrive_folder_id":self._v_gdrive_folder.get().strip(),
+            "schedule_hour":        hour,
+            "schedule_minute":      minute,
+            "retention_days":       int(self._v_retention.get() or 90),
+            "cleanup_server":       self._v_cleanup.get(),
+        }
+        self.destroy()
+
+    def show(self) -> dict | None:
+        """Block until the dialog closes and return the rule dict or None."""
+        self.wait_window()
+        return self._result
+
+
 class BackupApp:
     """Root window and controller for the Odoo Backup Tool."""
 
@@ -193,6 +495,9 @@ class BackupApp:
         # Persistent connection profiles (loaded from ~/.odoo_backup_tool/servers.json)
         self._profiles = ProfileManager()
 
+        # Schedule rules manager (shared with BackupScheduler)
+        self._sched_mgr = ScheduleManager()
+
         # ── Backup state variables ────────────────────────────────────────
         self._v_db = tk.StringVar()
         self._v_dump_fmt = tk.StringVar(value="dump")
@@ -205,6 +510,10 @@ class BackupApp:
         # Google Drive destination fields
         self._v_gdrive_creds  = tk.StringVar()   # path to service account JSON
         self._v_gdrive_folder = tk.StringVar()   # Drive folder ID
+
+        # Drive fields stored inside the server profile (Tab 1)
+        self._v_prof_gdrive_creds  = tk.StringVar()
+        self._v_prof_gdrive_folder = tk.StringVar()
 
         # ── Restore state variables ───────────────────────────────────────
         # 'origin' | 'dest' | 'other'
@@ -266,6 +575,11 @@ class BackupApp:
         # Kick off the background update check after the UI is ready.
         # The callback schedules the banner display on the main thread via root.after.
         check_for_update(GITHUB_REPO, APP_VERSION, self._on_update_check_result)
+
+        # Start the backup scheduler daemon thread.
+        # It shares self._q so schedule events land in the same poll loop.
+        self._scheduler = BackupScheduler(self._sched_mgr, self._profiles, self._q)
+        self._scheduler.start()
 
     # ── Theme / Style ─────────────────────────────────────────────────────
 
@@ -570,6 +884,7 @@ class BackupApp:
         self._tab_explorer()
         self._tab_terminal()
         self._tab_trial()
+        self._tab_automation()
 
         # Lock backup tabs 2-5 until connected
         for i in range(1, 5):
@@ -1157,6 +1472,42 @@ class BackupApp:
             pnl_prof, text="Eliminar",
             command=self._delete_profile,
         ).grid(row=0, column=2, padx=2)
+
+        # Drive config fields inside the profile panel (for automation)
+        pnl_prof.columnconfigure(1, weight=1)
+        ttk.Separator(pnl_prof, orient="horizontal").grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(_PAD, 4)
+        )
+        ttk.Label(pnl_prof, text="Google Drive (automatizacion):",
+                  font=("Segoe UI", 8, "bold")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(0, 2)
+        )
+        ttk.Label(pnl_prof, text="Credenciales JSON:").grid(
+            row=3, column=0, sticky="e", padx=(0, _PAD), pady=2
+        )
+        _prof_creds_row = ttk.Frame(pnl_prof)
+        _prof_creds_row.grid(row=3, column=1, columnspan=2, sticky="ew", pady=2)
+        _prof_creds_row.columnconfigure(0, weight=1)
+        ttk.Entry(_prof_creds_row, textvariable=self._v_prof_gdrive_creds).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(
+            _prof_creds_row, text="...",
+            command=lambda: self._v_prof_gdrive_creds.set(
+                filedialog.askopenfilename(
+                    title="Seleccionar credenciales de Drive",
+                    filetypes=[("JSON", "*.json"), ("Todos", "*.*")],
+                ) or self._v_prof_gdrive_creds.get()
+            ),
+            width=3,
+        ).grid(row=0, column=1)
+
+        ttk.Label(pnl_prof, text="Carpeta Drive (ID):").grid(
+            row=4, column=0, sticky="e", padx=(0, _PAD), pady=2
+        )
+        ttk.Entry(pnl_prof, textvariable=self._v_prof_gdrive_folder).grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=2
+        )
 
         # Connection fields — Servidor A
         self._cv: dict[str, tk.StringVar] = {
@@ -1774,6 +2125,8 @@ class BackupApp:
             self._cv["port"].set(str(p["port"]))
             self._cv["user"].set(p["user"])
             self._cv["pass"].set(p["password"])
+            self._v_prof_gdrive_creds.set(p.get("gdrive_creds_path", ""))
+            self._v_prof_gdrive_folder.set(p.get("gdrive_folder_id", ""))
 
     def _save_profile(self) -> None:
         """Save current Tab-1 connection fields as a named profile."""
@@ -1797,6 +2150,8 @@ class BackupApp:
                 port=int(self._cv["port"].get() or 22),
                 user=self._cv["user"].get(),
                 password=self._cv["pass"].get(),
+                gdrive_creds_path=self._v_prof_gdrive_creds.get(),
+                gdrive_folder_id=self._v_prof_gdrive_folder.get(),
             )
             self._refresh_profile_combos()
             self._cb_profile.set(name)
@@ -2875,6 +3230,19 @@ class BackupApp:
 
                 elif event == "btn_addons_enable":
                     self._btn_sync_addons.config(state="normal")
+
+                # ── Scheduler events ──────────────────────────────────────
+                elif event == "sched_refresh":
+                    self._sched_refresh_tree(data)
+
+                elif event == "sched_log":
+                    rule_id, message = data
+                    self._append_log(message)
+                    # Also update the automation tab log if it exists
+                    try:
+                        self._sched_append_log(message)
+                    except Exception:
+                        pass
 
         except queue.Empty:
             pass
@@ -5015,4 +5383,263 @@ class BackupApp:
         self._ssh.close()
         self._ssh_restore.close()
         self._ssh_dest.close()
+        # Stop the background scheduler daemon before destroying the window
+        try:
+            self._scheduler.stop()
+        except Exception:
+            pass
         self.root.destroy()
+
+    # ── Tab 11: Automatización ────────────────────────────────────────────
+
+    def _tab_automation(self) -> None:
+        """
+        Tab Automatizacion: manage scheduled backup rules and monitor the
+        background scheduler. Reuses ProfileManager + ScheduleManager.
+        """
+        outer = ttk.Frame(self.nb)
+        self.nb.add(outer, text="  Automatizacion  ")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        _C_AMBER = "#FFF3CD"
+        _C_AMBER_FG = "#664D03"
+
+        # ── Status bar ────────────────────────────────────────────────────
+        status_bar = ttk.Frame(outer)
+        status_bar.grid(row=0, column=0, sticky="ew", padx=_PAD, pady=(_PAD, 4))
+        status_bar.columnconfigure(1, weight=1)
+
+        self._lbl_sched_status = ttk.Label(
+            status_bar,
+            text="● Programador activo",
+            foreground="#2E8B57",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self._lbl_sched_status.grid(row=0, column=0, sticky="w")
+
+        btn_toggle = ttk.Button(
+            status_bar,
+            text="⏸ Pausar",
+            command=self._sched_toggle_pause,
+        )
+        btn_toggle.grid(row=0, column=2, padx=(0, 4))
+        self._btn_sched_toggle = btn_toggle
+
+        # ── Rule list (Treeview) ─────────────────────────────────────────
+        lf_rules = ttk.LabelFrame(outer, text="Reglas de backup programado", padding=_PAD)
+        lf_rules.grid(row=1, column=0, sticky="nsew", padx=_PAD, pady=(0, 4))
+        lf_rules.columnconfigure(0, weight=1)
+        lf_rules.rowconfigure(0, weight=1)
+
+        cols = ("#", "Habilitado", "Cliente", "BD", "Destino", "Hora", "Proximo", "Ultimo resultado")
+        self._sched_tree = ttk.Treeview(
+            lf_rules,
+            columns=cols,
+            show="headings",
+            height=8,
+            selectmode="browse",
+        )
+        col_widths = [30, 80, 140, 140, 90, 70, 120, 200]
+        for col, w in zip(cols, col_widths):
+            self._sched_tree.heading(col, text=col)
+            self._sched_tree.column(col, width=w, anchor="center" if col in ("#", "Habilitado", "Hora", "Proximo") else "w")
+
+        self._sched_tree.grid(row=0, column=0, sticky="nsew")
+
+        vsb = ttk.Scrollbar(lf_rules, orient="vertical", command=self._sched_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._sched_tree.configure(yscrollcommand=vsb.set)
+
+        # Tag colors for last result column
+        self._sched_tree.tag_configure("ok",    foreground="#2E8B57")
+        self._sched_tree.tag_configure("error", foreground="#C0392B")
+        self._sched_tree.tag_configure("none",  foreground="#888888")
+
+        # ── Action buttons ────────────────────────────────────────────────
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=2, column=0, sticky="ew", padx=_PAD, pady=4)
+
+        ttk.Button(
+            btn_row, text="+ Agregar",
+            style="Primary.TButton",
+            command=self._sched_add,
+        ).pack(side="left", padx=(0, 4))
+
+        ttk.Button(
+            btn_row, text="Editar",
+            command=self._sched_edit,
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            btn_row, text="Eliminar",
+            style="Stop.TButton",
+            command=self._sched_delete,
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            btn_row, text="▶ Ejecutar ahora",
+            command=self._sched_run_now,
+        ).pack(side="left", padx=4)
+
+        # ── Scheduler log ─────────────────────────────────────────────────
+        lf_log = ttk.LabelFrame(outer, text="Log del programador", padding=_PAD)
+        lf_log.grid(row=3, column=0, sticky="ew", padx=_PAD, pady=(0, _PAD))
+        lf_log.columnconfigure(0, weight=1)
+
+        self._sched_log_text = tk.Text(
+            lf_log,
+            height=6,
+            state="disabled",
+            wrap="word",
+            font=("Consolas", 8),
+            bg=_LOG_BG,
+            fg=_LOG_FG,
+        )
+        self._sched_log_text.grid(row=0, column=0, sticky="ew")
+        sb_log = ttk.Scrollbar(lf_log, orient="vertical", command=self._sched_log_text.yview)
+        sb_log.grid(row=0, column=1, sticky="ns")
+        self._sched_log_text.configure(yscrollcommand=sb_log.set)
+
+        # Populate tree on first display
+        self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_refresh_tree(self, rules: list) -> None:
+        """Rebuild the automation Treeview from the given rule list."""
+        try:
+            tree = self._sched_tree
+        except AttributeError:
+            return
+        tree.delete(*tree.get_children())
+        for i, r in enumerate(rules, 1):
+            label      = r.get("label") or r.get("db_name", "—")
+            db_name    = r.get("db_name", "")
+            dest_type  = r.get("dest_type", "gdrive")
+            hour       = r.get("schedule_hour", 2)
+            minute     = r.get("schedule_minute", 0)
+            enabled    = "Si" if r.get("enabled") else "No"
+            last_res   = r.get("last_result") or "—"
+            last_msg   = r.get("last_message", "")
+            last_run   = r.get("last_run_ts", "")
+            last_run_d = last_run[:10] if last_run else "Nunca"
+
+            # Next run estimate
+            from datetime import datetime as _dt
+            try:
+                now = _dt.now()
+                due = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+                if now >= due:
+                    from datetime import timedelta
+                    due = due + timedelta(days=1)
+                next_str = due.strftime("%m/%d %H:%M")
+            except Exception:
+                next_str = f"{hour:02d}:{minute:02d}"
+
+            result_display = last_res if last_res == "—" else last_res
+            if last_msg and last_res != "—":
+                result_display = f"{last_res} — {last_msg[:60]}"
+
+            tag = "ok" if last_res == "ok" else ("error" if last_res == "error" else "none")
+            tree.insert(
+                "", "end",
+                iid=r["id"],
+                values=(i, enabled, label, db_name, dest_type,
+                        f"{int(hour):02d}:{int(minute):02d}",
+                        next_str, result_display),
+                tags=(tag,),
+            )
+
+    def _sched_append_log(self, message: str) -> None:
+        """Append a line to the scheduler log widget (GUI thread only)."""
+        try:
+            w = self._sched_log_text
+        except AttributeError:
+            return
+        import datetime as _dt_mod
+        ts = _dt_mod.datetime.now().strftime("%H:%M:%S")
+        w.config(state="normal")
+        w.insert("end", f"[{ts}]  {message}\n")
+        w.see("end")
+        w.config(state="disabled")
+
+    def _sched_toggle_pause(self) -> None:
+        """Toggle the scheduler between paused and active states."""
+        if self._scheduler.is_paused:
+            self._scheduler.resume()
+            self._lbl_sched_status.config(
+                text="● Programador activo", foreground="#2E8B57"
+            )
+            self._btn_sched_toggle.config(text="⏸ Pausar")
+        else:
+            self._scheduler.pause()
+            self._lbl_sched_status.config(
+                text="⏸ Programador pausado", foreground="#888888"
+            )
+            self._btn_sched_toggle.config(text="▶ Reanudar")
+
+    def _sched_selected_id(self) -> str | None:
+        """Return the rule ID of the currently selected Treeview row, or None."""
+        sel = self._sched_tree.selection()
+        return sel[0] if sel else None
+
+    def _sched_add(self) -> None:
+        """Open the schedule dialog to create a new rule."""
+        dlg = _ScheduleDialog(self.root, self._profiles, None)
+        result = dlg.show()
+        if result:
+            self._sched_mgr.add(result)
+            self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_edit(self) -> None:
+        """Open the schedule dialog pre-filled with the selected rule."""
+        rule_id = self._sched_selected_id()
+        if not rule_id:
+            messagebox.showwarning(APP_TITLE, "Seleccione una regla para editar.")
+            return
+        rule = self._sched_mgr.get(rule_id)
+        if not rule:
+            return
+        dlg = _ScheduleDialog(self.root, self._profiles, rule)
+        result = dlg.show()
+        if result:
+            self._sched_mgr.update(rule_id, result)
+            self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_delete(self) -> None:
+        """Delete the selected rule after confirmation."""
+        rule_id = self._sched_selected_id()
+        if not rule_id:
+            messagebox.showwarning(APP_TITLE, "Seleccione una regla para eliminar.")
+            return
+        rule = self._sched_mgr.get(rule_id)
+        label = rule.get("label") if rule else rule_id
+        if not messagebox.askyesno(APP_TITLE, f'¿Eliminar la regla "{label}"?'):
+            return
+        self._sched_mgr.delete(rule_id)
+        self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_run_now(self) -> None:
+        """Force-run the selected rule immediately (ignores schedule time)."""
+        rule_id = self._sched_selected_id()
+        if not rule_id:
+            messagebox.showwarning(APP_TITLE, "Seleccione una regla para ejecutar.")
+            return
+        rule = self._sched_mgr.get(rule_id)
+        if not rule:
+            return
+        label = rule.get("label") or rule.get("db_name", rule_id[:8])
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f'¿Ejecutar ahora el backup "{label}"?\n\n'
+            "Se ejecutara en segundo plano. El resultado aparecera en el log.",
+        ):
+            return
+        # Run in a fresh thread via the scheduler's _run_rule logic
+        t = threading.Thread(
+            target=self._scheduler._run_rule,
+            args=(rule,),
+            name=f"sched-manual-{rule_id[:8]}",
+            daemon=True,
+        )
+        t.start()
+        self._sched_append_log(f"[{label}] Ejecucion manual iniciada...")

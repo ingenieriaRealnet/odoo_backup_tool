@@ -40,6 +40,10 @@ pyinstaller ^
     --hidden-import googleapiclient.discovery ^
     --hidden-import googleapiclient.http ^
     --hidden-import googleapiclient.errors ^
+    --hidden-import plyer ^
+    --hidden-import plyer.platforms ^
+    --hidden-import plyer.platforms.win ^
+    --hidden-import plyer.platforms.win.notification ^
     --add-data "icon.ico;." ^
     main.py
 
