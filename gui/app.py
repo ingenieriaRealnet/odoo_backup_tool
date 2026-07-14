@@ -10,6 +10,7 @@ import datetime
 import json
 import os
 import queue
+import tempfile
 import threading
 import tkinter as tk
 import re
@@ -18,12 +19,15 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from core.addons_manager import AddonsManager, scan_ssh_directory
 from core.file_browser import RemoteBrowser
 from core.db_manager import DBManager
+from core.gdrive import DriveUploader
 from core.inventory_manager import InventoryManager
 from core.filestore_manager import FilestoreManager
 from core.profiles import ProfileManager
 from core.restore_manager import RestoreManager
 from core.ssh_client import SSHClient
 from core.transfer import TransferManager
+from core.version import APP_VERSION, GITHUB_REPO
+from core.updater import check_for_update
 from gui.help_window import HelpWindow
 from gui.file_browser_panel import FileBrowserPanel
 from gui.ssh_terminal_panel import SshTerminalPanel
@@ -198,6 +202,9 @@ class BackupApp:
         self._v_local_dir = tk.StringVar(
             value=os.path.join(os.path.expanduser("~"), "Downloads")
         )
+        # Google Drive destination fields
+        self._v_gdrive_creds  = tk.StringVar()   # path to service account JSON
+        self._v_gdrive_folder = tk.StringVar()   # Drive folder ID
 
         # ── Restore state variables ───────────────────────────────────────
         # 'origin' | 'dest' | 'other'
@@ -248,6 +255,10 @@ class BackupApp:
 
         self._build_ui()
         self._poll_queue()
+
+        # Kick off the background update check after the UI is ready.
+        # The callback schedules the banner display on the main thread via root.after.
+        check_for_update(GITHUB_REPO, APP_VERSION, self._on_update_check_result)
 
     # ── Theme / Style ─────────────────────────────────────────────────────
 
@@ -464,7 +475,7 @@ class BackupApp:
 
         tk.Label(
             header,
-            text="v1.0  —  Realnet  ",
+            text=f"v{APP_VERSION}  —  Realnet  ",
             font=("Segoe UI", 9),
             bg=_DARK_BG, fg="#C4AAB8",
         ).pack(side="right", pady=8)
@@ -479,6 +490,51 @@ class BackupApp:
             padx=6, pady=2,
             command=self._open_help,
         ).pack(side="right", padx=(0, 6), pady=10)
+
+        # ── Update notification banner (hidden; shown by _show_update_banner) ──
+        # Created here so it sits between header and paned in the pack order.
+        _BNR_BG   = "#FFF3CD"   # amber warning background
+        _BNR_FG   = "#664D03"   # dark amber text
+        _BNR_BTN  = "#664D03"   # download button background
+
+        self._frm_banner = tk.Frame(self.root, bg=_BNR_BG, pady=5)
+        # Not packed yet — _show_update_banner() positions it via pack(before=).
+
+        tk.Label(
+            self._frm_banner,
+            text="⚠",
+            font=("Segoe UI", 11),
+            bg=_BNR_BG, fg=_BNR_FG,
+        ).pack(side="left", padx=(10, 4))
+
+        self._lbl_banner_text = tk.Label(
+            self._frm_banner,
+            text="",
+            font=("Segoe UI", 9),
+            bg=_BNR_BG, fg=_BNR_FG,
+        )
+        self._lbl_banner_text.pack(side="left")
+
+        self._btn_banner_dl = tk.Button(
+            self._frm_banner,
+            text=" Descargar actualización ",
+            font=("Segoe UI", 8, "bold"),
+            bg=_BNR_BTN, fg="white",
+            relief="flat", cursor="hand2",
+            padx=6, pady=2,
+        )
+        self._btn_banner_dl.pack(side="left", padx=(12, 4))
+
+        tk.Button(
+            self._frm_banner,
+            text=" × ",
+            font=("Segoe UI", 11, "bold"),
+            bg=_BNR_BG, fg=_BNR_FG,
+            activebackground=_BNR_BG, activeforeground="#3D2B02",
+            relief="flat", cursor="hand2",
+            padx=4, pady=0,
+            command=self._dismiss_update_banner,
+        ).pack(side="right", padx=(0, 8))
 
         # ── Resizable PanedWindow: notebook (top) + log (bottom) ─────────
         # tk.PanedWindow gives a visible, draggable sash the user can resize.
@@ -818,6 +874,48 @@ class BackupApp:
             return
         self._help_win = HelpWindow(self)
 
+    # ── Update banner ────────────────────────────────────────────────────
+
+    def _on_update_check_result(
+        self, new_version: str | None, download_url: str | None
+    ) -> None:
+        """
+        Callback invoked from the background update-checker thread.
+
+        Schedules the banner display on the Tkinter main thread so it is
+        always safe to call from any thread.
+        """
+        if new_version:
+            self.root.after(
+                0, lambda: self._show_update_banner(new_version, download_url or "")
+            )
+
+    def _show_update_banner(self, version: str, download_url: str) -> None:
+        """
+        Reveal the update banner below the header bar.
+
+        Uses pack(before=self._paned) so the banner is always positioned
+        between the header and the main content area regardless of when it
+        is called.
+        """
+        self._lbl_banner_text.config(
+            text=f"Nueva version {version} disponible — version instalada: {APP_VERSION}"
+        )
+        self._btn_banner_dl.config(
+            command=lambda: self._open_update_download(download_url)
+        )
+        self._frm_banner.pack(fill="x", before=self._paned)
+
+    def _dismiss_update_banner(self) -> None:
+        """Hide the update banner (user dismissed it)."""
+        self._frm_banner.pack_forget()
+
+    def _open_update_download(self, url: str) -> None:
+        """Open the download URL in the system default browser."""
+        import webbrowser
+        if url:
+            webbrowser.open(url)
+
     # ── Shared helper ────────────────────────────────────────────────────
 
     def _scrollable_tab(self, tab_text: str) -> ttk.Frame:
@@ -1106,9 +1204,15 @@ class BackupApp:
             command=self._toggle_dest_panels,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
 
+        ttk.Radiobutton(
+            f, text="Google Drive (Service Account)",
+            variable=self._v_dest_type, value="gdrive",
+            command=self._toggle_dest_panels,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+
         # Local panel
         self._pnl_local = ttk.LabelFrame(f, text="Destino local", padding=_PAD)
-        self._pnl_local.grid(row=3, column=0, columnspan=3, sticky="ew", pady=_PAD)
+        self._pnl_local.grid(row=4, column=0, columnspan=3, sticky="ew", pady=_PAD)
         self._pnl_local.columnconfigure(1, weight=1)
         ttk.Label(self._pnl_local, text="Carpeta destino:").grid(row=0, column=0, sticky="e", padx=(0, _PAD))
         ttk.Entry(self._pnl_local, textvariable=self._v_local_dir).grid(row=0, column=1, sticky="ew")
@@ -1125,7 +1229,7 @@ class BackupApp:
             "dir": tk.StringVar(value="/opt/backups"),
         }
         self._pnl_remote = ttk.LabelFrame(f, text="Servidor destino", padding=_PAD)
-        self._pnl_remote.grid(row=4, column=0, columnspan=3, sticky="ew", pady=_PAD)
+        self._pnl_remote.grid(row=5, column=0, columnspan=3, sticky="ew", pady=_PAD)
         # Column 0: labels (fixed); column 1: inputs (expand)
         self._pnl_remote.columnconfigure(0, minsize=120)
         self._pnl_remote.columnconfigure(1, weight=1)
@@ -1167,8 +1271,58 @@ class BackupApp:
             )
         self._pnl_remote.grid_remove()  # Hidden by default
 
+        # ── Google Drive destination panel ────────────────────────────────
+        self._pnl_gdrive = ttk.LabelFrame(f, text="Google Drive", padding=_PAD)
+        self._pnl_gdrive.grid(row=6, column=0, columnspan=3, sticky="ew", pady=_PAD)
+        self._pnl_gdrive.columnconfigure(1, weight=1)
+
+        # Info note
+        ttk.Label(
+            self._pnl_gdrive,
+            text=(
+                "Autenticacion via Service Account. Descargue el JSON desde\n"
+                "Google Cloud Console > IAM > Cuentas de servicio > Claves."
+            ),
+            foreground="#666666",
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, _PAD))
+
+        # Row 1: Service Account JSON
+        ttk.Label(self._pnl_gdrive, text="Archivo JSON:").grid(
+            row=1, column=0, sticky="e", padx=(0, _PAD), pady=4
+        )
+        ttk.Entry(self._pnl_gdrive, textvariable=self._v_gdrive_creds).grid(
+            row=1, column=1, sticky="ew", pady=4
+        )
+        ttk.Button(
+            self._pnl_gdrive, text="Examinar...",
+            command=self._browse_gdrive_creds,
+        ).grid(row=1, column=2, padx=_PAD, pady=4)
+
+        # Row 2: Folder ID
+        ttk.Label(self._pnl_gdrive, text="ID de carpeta:").grid(
+            row=2, column=0, sticky="e", padx=(0, _PAD), pady=4
+        )
+        ttk.Entry(self._pnl_gdrive, textvariable=self._v_gdrive_folder).grid(
+            row=2, column=1, sticky="ew", pady=4
+        )
+        ttk.Button(
+            self._pnl_gdrive, text="Verificar conexion",
+            command=self._verify_gdrive_conn,
+        ).grid(row=2, column=2, padx=_PAD, pady=4)
+
+        # Row 3: Help hint for folder ID
+        ttk.Label(
+            self._pnl_gdrive,
+            text="El ID aparece al final de la URL de la carpeta en Drive.",
+            foreground="#888888",
+            font=("Segoe UI", 8),
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        self._pnl_gdrive.grid_remove()  # Hidden by default
+
         ttk.Button(f, text="Siguiente ->", style="Nav.TButton", command=self._goto_execute).grid(
-            row=5, column=0, columnspan=3, pady=_PAD * 2
+            row=7, column=0, columnspan=3, pady=_PAD * 2
         )
 
     # ── Tab 5: Execute ───────────────────────────────────────────────────
@@ -1235,7 +1389,8 @@ class BackupApp:
 
     def _goto_execute(self) -> None:
         # Warn (non-blocking) if remote dest is chosen but fields are incomplete
-        if self._v_dest_type.get() == "remote":
+        dest = self._v_dest_type.get()
+        if dest == "remote":
             missing = [
                 label for key, label in [
                     ("host", "IP / Hostname"),
@@ -1253,30 +1408,96 @@ class BackupApp:
                     + "\n\n¿Continuar de todas formas?"
                 ):
                     return
+        elif dest == "gdrive":
+            missing_gd = []
+            if not self._v_gdrive_creds.get().strip():
+                missing_gd.append("Archivo JSON de Service Account")
+            if not self._v_gdrive_folder.get().strip():
+                missing_gd.append("ID de carpeta en Drive")
+            if missing_gd:
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    "Faltan campos para Google Drive:\n  • "
+                    + "\n  • ".join(missing_gd)
+                    + "\n\n¿Continuar de todas formas?"
+                ):
+                    return
         self.nb.tab(4, state="normal")
         self.nb.select(4)
         self._refresh_summary()
 
     def _toggle_dest_panels(self) -> None:
-        if self._v_dest_type.get() == "local":
+        dest = self._v_dest_type.get()
+        self._pnl_local.grid_remove()
+        self._pnl_remote.grid_remove()
+        self._pnl_gdrive.grid_remove()
+        if dest == "local":
             self._pnl_local.grid()
-            self._pnl_remote.grid_remove()
-        else:
-            self._pnl_local.grid_remove()
+        elif dest == "remote":
             self._pnl_remote.grid()
+        else:  # gdrive
+            self._pnl_gdrive.grid()
 
     def _browse_local(self) -> None:
         path = filedialog.askdirectory(title="Seleccionar carpeta destino")
         if path:
             self._v_local_dir.set(path)
 
+    def _browse_gdrive_creds(self) -> None:
+        """Open a file picker for the Service Account JSON key file."""
+        path = filedialog.askopenfilename(
+            title="Seleccionar archivo de credenciales de Service Account",
+            filetypes=[("JSON", "*.json"), ("Todos", "*.*")],
+        )
+        if path:
+            self._v_gdrive_creds.set(path)
+
+    def _verify_gdrive_conn(self) -> None:
+        """Test Drive credentials and folder access, show result in a dialog."""
+        creds = self._v_gdrive_creds.get().strip()
+        folder = self._v_gdrive_folder.get().strip()
+        if not creds or not folder:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Complete los campos 'Archivo JSON' e 'ID de carpeta' antes de verificar."
+            )
+            return
+        # Run in thread to avoid freezing the GUI
+        def _run() -> None:
+            uploader = DriveUploader(creds, folder)
+            ok, msg = uploader.verify_connection()
+            if ok:
+                self._q.put(("log", f"[Drive] Conexion verificada. Carpeta: '{msg}'"))
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        APP_TITLE,
+                        f"Conexion exitosa.\nCarpeta de destino: \"{msg}\"",
+                    ),
+                )
+            else:
+                self._q.put(("log", f"[Drive] Error de conexion: {msg}"))
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        APP_TITLE,
+                        f"No se pudo conectar a Google Drive:\n\n{msg}",
+                    ),
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _refresh_summary(self) -> None:
         """Rebuild the summary text from current selections."""
         fs_db = self._v_fs_db.get() or self._v_db.get()
-        if self._v_dest_type.get() == "local":
+        dest_type = self._v_dest_type.get()
+        if dest_type == "local":
             dest_str = f"Local -> {self._v_local_dir.get()}"
-        else:
+        elif dest_type == "remote":
             dest_str = f"Remoto -> {self._dv['user'].get()}@{self._dv['host'].get()}:{self._dv['dir'].get()}"
+        else:
+            folder = self._v_gdrive_folder.get() or "(sin carpeta)"
+            dest_str = f"Google Drive -> carpeta {folder}"
 
         lines = [
             f"Servidor origen  : {self._ssh.host}:{self._ssh.port}",
@@ -1530,8 +1751,10 @@ class BackupApp:
                 )
                 return False
 
+        dest_type = self._v_dest_type.get()
+
         # Destination: local
-        if self._v_dest_type.get() == "local":
+        if dest_type == "local":
             if not self._v_local_dir.get().strip():
                 messagebox.showwarning(
                     APP_TITLE, "Seleccione una carpeta destino local (Tab 4)."
@@ -1539,7 +1762,7 @@ class BackupApp:
                 return False
 
         # Destination: remote server
-        else:
+        elif dest_type == "remote":
             missing = [
                 label for key, label in [
                     ("host", "IP / Hostname"),
@@ -1563,6 +1786,30 @@ class BackupApp:
                 messagebox.showerror(
                     APP_TITLE,
                     "El puerto del servidor destino debe ser un numero entero."
+                )
+                return False
+
+        # Destination: Google Drive
+        else:
+            creds  = self._v_gdrive_creds.get().strip()
+            folder = self._v_gdrive_folder.get().strip()
+            if not creds:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Seleccione el archivo JSON de Service Account para Google Drive (Tab 4)."
+                )
+                return False
+            if not os.path.isfile(creds):
+                messagebox.showerror(
+                    APP_TITLE,
+                    f"El archivo de credenciales no existe:\n{creds}\n\n"
+                    "Verifique la ruta o seleccione otro archivo."
+                )
+                return False
+            if not folder:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Ingrese el ID de la carpeta de Google Drive destino (Tab 4)."
                 )
                 return False
 
@@ -1796,6 +2043,9 @@ class BackupApp:
             params["dest_user"] = self._dv["user"].get()
             params["dest_pass"] = self._dv["pass"].get()
             params["dest_dir"] = self._dv["dir"].get()
+        elif params["dest_type"] == "gdrive":
+            params["gdrive_creds"]  = self._v_gdrive_creds.get()
+            params["gdrive_folder"] = self._v_gdrive_folder.get()
 
         threading.Thread(target=self._worker_backup, args=(params,), daemon=True).start()
 
@@ -1893,6 +2143,13 @@ class BackupApp:
                 advance(f"Filestore comprimido: {fs_path}")
 
             # ── 3. Transfer each file
+            # For Google Drive: a shared DriveUploader is built once per backup run.
+            gdrive_uploader = (
+                DriveUploader(p["gdrive_creds"], p["gdrive_folder"])
+                if p["dest_type"] == "gdrive"
+                else None
+            )
+
             for remote_file in remote_tmp:
                 fname = os.path.basename(remote_file)
 
@@ -1915,7 +2172,8 @@ class BackupApp:
                         progress_callback=_prog,
                         log_callback=self._log,
                     )
-                else:
+
+                elif p["dest_type"] == "remote":
                     # Check if file already exists on the remote destination
                     if transfer.remote_file_exists(
                         p["dest_host"], int(p["dest_port"]),
@@ -1940,6 +2198,42 @@ class BackupApp:
                         dest_filename=fname,
                         log_callback=self._log,
                     )
+
+                else:
+                    # ── Google Drive: download to local temp, then upload to Drive ──
+                    # The tool never stores the file permanently on the local machine;
+                    # the temp file is deleted as soon as the Drive upload finishes.
+                    tmp_dir = tempfile.mkdtemp(prefix="odoo_bkp_drive_")
+                    try:
+                        def _prog_dl(transferred: int, total: int, _f: str = fname) -> None:
+                            pct = (transferred / total * 100) if total else 0
+                            self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
+
+                        local_tmp = transfer.download_to_local(
+                            remote_file, tmp_dir,
+                            dest_filename=fname,
+                            progress_callback=_prog_dl,
+                            log_callback=self._log,
+                        )
+
+                        def _prog_up(uploaded: int, total: int, _f: str = fname) -> None:
+                            pct = (uploaded / total * 100) if total else 0
+                            self._q.put(("progress", (pct, f"Subiendo {_f} a Drive ... {pct:.0f}%")))
+
+                        gdrive_uploader.upload_file(
+                            local_tmp,
+                            dest_filename=fname,
+                            progress_callback=_prog_up,
+                            log_callback=self._log,
+                        )
+                    finally:
+                        # Always clean up the local temp file
+                        try:
+                            if os.path.exists(os.path.join(tmp_dir, fname)):
+                                os.remove(os.path.join(tmp_dir, fname))
+                            os.rmdir(tmp_dir)
+                        except OSError:
+                            pass
 
                 # Update final_dump_fname with the resolved name AFTER the overwrite
                 # dialog — fname may have been renamed with a timestamp at this point.
@@ -1968,6 +2262,21 @@ class BackupApp:
                         inv_local = os.path.join(p["local_dir"], inv_filename)
                         InventoryManager.save(inventory, inv_local)
                         self._log(f"Inventario guardado: {inv_local}")
+                    elif p["dest_type"] == "gdrive":
+                        # Save locally first, then upload to Drive alongside the backup
+                        inv_local = os.path.join(
+                            InventoryManager.local_inventory_dir(), inv_filename
+                        )
+                        InventoryManager.save(inventory, inv_local)
+                        self._log(f"Inventario guardado localmente: {inv_local}")
+                        try:
+                            gdrive_uploader.upload_file(
+                                inv_local,
+                                dest_filename=inv_filename,
+                                log_callback=self._log,
+                            )
+                        except Exception as exc_inv:
+                            self._log(f"[aviso] No se pudo subir el inventario a Drive: {exc_inv}")
                     else:
                         # For remote destinations, keep a local copy in the
                         # inventories folder so the user can find it later

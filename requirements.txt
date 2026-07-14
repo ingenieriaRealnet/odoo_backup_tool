@@ -3,3 +3,8 @@
 paramiko>=3.4.0
 Pillow>=10.0.0
 pyinstaller>=6.0.0
+
+# Google Drive destination (Tab 4)
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-httplib2>=0.1.0

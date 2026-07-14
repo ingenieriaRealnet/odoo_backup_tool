@@ -1,15 +1,21 @@
 """
 Odoo Backup Tool — Icon generator.
 
-Produces icon.ico with multiple sizes for the Windows executable and
-the application window.
+Converts new_image.png (512x512 RGBA) into icon.ico with multiple embedded
+sizes for the Windows executable and the application window.
 
-Design:
-  - Odoo purple (#714B67) rounded-square background
-  - White database cylinder (3 horizontal platters)
-  - Teal (#00A09D) accent stripe on the top platter (echoes Odoo's brand stripe)
+Quality strategy:
+  - LANCZOS resampling for all downscale steps (best edge preservation).
+  - Light UnsharpMask pass on sizes <= 32 px to recover fine detail lost
+    when reducing to very small icons (standard technique in professional
+    icon pipelines — avoids the soft/blurry look without visible halos).
+  - All sizes embedded in a single ICO file so Windows picks the right one
+    per context (taskbar, explorer, title bar, Alt+Tab, etc.).
 
-Uses 4x supersampling + LANCZOS downscale for smooth edges at all sizes.
+Source image requirements:
+  - new_image.png in the same directory as this script.
+  - 512x512 px or larger, RGBA (transparency supported).
+  - Minimum recommended: 256x256.
 
 Run once before building:
     python create_icon.py
@@ -20,106 +26,110 @@ import os
 import sys
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageFilter
 except ImportError:
     sys.exit(
         "Pillow no esta instalado. Ejecuta: pip install Pillow\n"
         "O usa: pip install -r requirements.txt"
     )
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-_PURPLE     = (113, 75, 103, 255)   # Odoo brand purple  #714B67
-_PURPLE_DRK = (80,  50,  72, 255)   # Darker shade for inner shadow
-_TEAL       = (0,  160, 157, 255)   # Odoo teal          #00A09D
-_WHITE      = (255, 255, 255, 255)
-_PLATTER_MID= (228, 212, 223, 255)  # Mid platter — slightly purple-tinted
-_PLATTER_BOT= (196, 174, 190, 255)  # Bottom platter — more muted
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# Source PNG relative to this script
+_SOURCE_NAME = "new_image.png"
+
+# Sizes embedded in the final .ico
+# Windows uses different sizes in different contexts:
+#   16  — title bar, small taskbar icons
+#   24  — some UI contexts in Win11
+#   32  — standard desktop icon (small view)
+#   48  — standard desktop icon (medium view)
+#   64  — large icon views, some file manager contexts
+#   128 — extra-large icon view
+#   256 — jumbo icon view, modern Windows contexts
+_SIZES = [16, 24, 32, 48, 64, 128, 256]
+
+# Threshold below which UnsharpMask is applied to recover fine detail
+_SHARPEN_THRESHOLD_PX = 32
+
+# UnsharpMask parameters (conservative — avoids visible halos)
+# radius: spread of the sharpening effect (px in the downscaled image)
+# percent: strength (100 = subtle, 200 = strong)
+# threshold: only sharpen where pixel difference > this value (0-255)
+_USM_RADIUS    = 0.6
+_USM_PERCENT   = 120
+_USM_THRESHOLD = 3
 
 
-def _draw_icon(size: int) -> Image.Image:
+def _resize_to(source: Image.Image, size: int) -> Image.Image:
     """
-    Draw a single icon frame at the given pixel size.
+    Resize `source` to (size x size) with LANCZOS + optional UnsharpMask.
 
-    Renders internally at 4× resolution then scales down with LANCZOS
-    for antialiased curves without requiring a third-party AA library.
+    The source is always treated as RGBA to preserve transparency.
 
     Args:
-        size: Target icon size in pixels (e.g. 32, 128).
+        source: Source image (should be RGBA, any size >= target).
+        size:   Target square size in pixels.
 
     Returns:
-        RGBA Image of exactly (size × size) pixels.
+        RGBA Image of exactly (size x size) pixels.
     """
-    S = size * 4  # supersampled canvas
+    # Ensure RGBA so transparent areas survive the resize correctly
+    img = source.convert("RGBA")
 
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d   = ImageDraw.Draw(img)
+    # LANCZOS (formerly ANTIALIAS) gives the sharpest edges on downscale
+    img = img.resize((size, size), Image.LANCZOS)
 
-    # ── Background: rounded square in Odoo purple ─────────────────────────
-    pad    = max(S // 16, 4)
-    radius = S // 5
-    d.rounded_rectangle(
-        [pad, pad, S - pad - 1, S - pad - 1],
-        radius=radius,
-        fill=_PURPLE,
-    )
+    # For very small sizes, add a subtle sharpening pass to compensate
+    # for the softening effect of aggressive downscaling.
+    if size <= _SHARPEN_THRESHOLD_PX:
+        img = img.filter(
+            ImageFilter.UnsharpMask(
+                radius=_USM_RADIUS,
+                percent=_USM_PERCENT,
+                threshold=_USM_THRESHOLD,
+            )
+        )
 
-    # ── Database cylinder geometry ────────────────────────────────────────
-    cx = S // 2
-    ew = int(S * 0.54)          # total ellipse width
-    eh = int(S * 0.15)          # ellipse height (flat = looks like a disc)
-    eh = max(eh, 6)
-
-    left  = cx - ew // 2
-    right = cx + ew // 2
-
-    # Three platters from top to bottom
-    top_y   = int(S * 0.18)
-    spacing = int(S * 0.215)
-
-    platters_y    = [top_y, top_y + spacing, top_y + spacing * 2]
-    platter_fills = [_WHITE, _PLATTER_MID, _PLATTER_BOT]
-
-    # Draw cylinder bodies (rectangles between consecutive platter centers),
-    # bottom to top so the upper platter renders on top.
-    for i in range(len(platters_y) - 1, 0, -1):
-        y0 = platters_y[i - 1] + eh // 2
-        y1 = platters_y[i]     + eh // 2
-        d.rectangle([left, y0, right, y1], fill=platter_fills[i])
-
-    # Draw each platter ellipse, bottom to top
-    for i in range(len(platters_y) - 1, -1, -1):
-        py = platters_y[i]
-        d.ellipse([left, py, right, py + eh], fill=platter_fills[i])
-
-    # ── Teal accent stripe on the top platter ─────────────────────────────
-    # Mirrors Odoo's brand stripe concept — a thin contrasting band.
-    stripe_h = max(S // 28, 3)
-    inset    = ew // 5
-    ty       = platters_y[0] + eh // 2 - stripe_h // 2
-    d.ellipse(
-        [left + inset, ty, right - inset, ty + stripe_h],
-        fill=_TEAL,
-    )
-
-    # ── Scale down with LANCZOS for antialiasing ──────────────────────────
-    return img.resize((size, size), Image.LANCZOS)
+    return img
 
 
 def main() -> None:
-    sizes   = [16, 24, 32, 48, 64, 128, 256]
-    images  = [_draw_icon(s) for s in sizes]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    source_path = os.path.join(script_dir, _SOURCE_NAME)
+    out_path    = os.path.join(script_dir, "icon.ico")
 
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+    # ── Load source image ─────────────────────────────────────────────────
+    if not os.path.isfile(source_path):
+        sys.exit(
+            f"No se encontro la imagen fuente: {source_path}\n"
+            f"Coloca '{_SOURCE_NAME}' en el mismo directorio que este script."
+        )
 
-    images[0].save(
+    source = Image.open(source_path)
+    print(f"Fuente: {source_path}  ({source.size[0]}x{source.size[1]}, {source.mode})")
+
+    if source.size[0] < 256 or source.size[1] < 256:
+        print(
+            f"  ADVERTENCIA: imagen fuente menor a 256x256. "
+            f"Los tamanios grandes del icono podrian verse pixelados."
+        )
+
+    # ── Generate each size ────────────────────────────────────────────────
+    frames = [_resize_to(source, s) for s in _SIZES]
+    print(f"Tamanios generados: {_SIZES}")
+
+    # ── Save as multi-size ICO ────────────────────────────────────────────
+    # Pillow embeds all frames in one ICO when append_images is used.
+    # Windows Explorer and the PE loader pick the best size automatically.
+    frames[0].save(
         out_path,
         format="ICO",
-        sizes=[(s, s) for s in sizes],
-        append_images=images[1:],
+        sizes=[(s, s) for s in _SIZES],
+        append_images=frames[1:],
     )
 
-    print(f"Icono generado correctamente: {out_path}")
-    print(f"Tamanios incluidos: {sizes}")
+    print(f"Icono guardado: {out_path}")
 
 
 if __name__ == "__main__":

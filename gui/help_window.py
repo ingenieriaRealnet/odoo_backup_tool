@@ -342,38 +342,48 @@ class HelpWindow(tk.Toplevel):
         self._h1("Odoo Backup Tool")
         self._p(
             "Herramienta de escritorio (Python + tkinter) para hacer respaldo y restauracion "
-            "de bases de datos e instancias Odoo Enterprise en servidores remotos via SSH."
+            "de bases de datos e instancias Odoo Enterprise en servidores remotos via SSH. "
+            "Soporta tres destinos de backup: maquina local, servidor remoto y Google Drive."
         )
         self._wl()
         self._h2("Que hace esta herramienta")
         self._bullet([
             "Conectarse a un servidor Odoo via SSH y crear un dump de la base de datos (SQL o pg_custom).",
             "Comprimir el filestore (adjuntos e imagenes) en un archivo ZIP.",
-            "Transferir el backup hacia un servidor destino remoto o hacia la maquina local.",
+            "Transferir el backup a la maquina local, a otro servidor remoto, o a Google Drive.",
             "Generar un inventario JSON con el estado exacto del backup (tablas, archivos, modulos).",
             "Restaurar una base de datos e importar el filestore en un servidor de destino.",
             "Verificar la integridad del backup comparando el inventario con la instancia restaurada.",
             "Sincronizar addons desde repositorios Git privados (con soporte de submodulos).",
             "Explorar y administrar archivos en servidores remotos via SFTP.",
+            "Terminal SSH interactiva integrada (xterm-256color, historial de comandos).",
         ])
 
         self._h2("Requisitos previos")
+        self._h3("Maquina local (donde corre la herramienta)")
         self._bullet([
-            "Acceso SSH al servidor origen (con clave o contrasena).",
-            "Usuario con permisos para ejecutar pg_dump y leer el filestore.",
-            "python 3.10+ con los paquetes: paramiko, pillow.",
-            "En el servidor: postgresql-client, zip/unzip instalados (o permisos de sudo para instalarlos).",
+            "Python 3.10+ con los paquetes: paramiko, pillow.",
+            "Para destino Google Drive: google-api-python-client, google-auth, google-auth-httplib2.",
+            "Archivo JSON de Service Account de Google (solo si usa el destino Drive).",
+        ])
+        self._h3("Servidor remoto (origen del backup)")
+        self._bullet([
+            "Acceso SSH con usuario que pueda ejecutar pg_dump y leer el filestore.",
+            "PostgreSQL cliente (pg_dump / pg_restore / psql) instalado.",
+            "zip / unzip instalado (o sudo para instalarlo automaticamente).",
+            "sshpass instalado en el origen si se usa destino 'Servidor remoto' (lo instala automaticamente).",
         ])
 
         self._h2("Flujo tipico de uso")
         steps = [
-            ("1", "Conexion",      "Conectarse al servidor origen en Tab 1."),
-            ("2", "Backup",        "Configurar y lanzar el backup en Tab 2."),
-            ("3", "Destino",       "Elegir donde guardar el backup (local o servidor) en Tab 4."),
-            ("4", "Transferencia", "La herramienta transfiere dump + filestore automaticamente."),
-            ("5", "Inventario",    "Se genera un inventario JSON junto al backup."),
-            ("6", "Restauracion",  "Seleccionar dump e inventario en Tab 6 para restaurar."),
-            ("7", "Verificacion",  "Tab 5 compara el inventario con la instancia restaurada."),
+            ("1", "Conexion",      "Tab 1: conectarse al servidor origen via SSH."),
+            ("2", "BD",            "Tab 2: seleccionar la base de datos a respaldar."),
+            ("3", "Filestore",     "Tab 3: verificar la ruta del filestore."),
+            ("4", "Destino",       "Tab 4: elegir donde guardar el backup (local, remoto o Drive)."),
+            ("5", "Ejecutar",      "Tab 5: lanzar el backup — dump + filestore + transferencia."),
+            ("6", "Inventario",    "Se genera automaticamente un inventario JSON junto al backup."),
+            ("7", "Restauracion",  "Tab 6: seleccionar dump e inventario para restaurar."),
+            ("8", "Verificacion",  "Tab 5 compara el inventario con la instancia restaurada."),
         ]
         for num, title, desc in steps:
             self._text.insert("end", f"  {num}. ", "bold")
@@ -382,8 +392,8 @@ class HelpWindow(tk.Toplevel):
         self._wl()
         self._note(
             "Cada operacion larga (dump, compresion, transferencia, restauracion) corre en "
-            "segundo plano con un boton 'Cancelar' activo. La herramienta puede cerrar y el "
-            "proceso en el servidor continua via nohup."
+            "segundo plano con un boton 'Cancelar' activo. Los procesos en el servidor usan "
+            "nohup y continuan aunque se cierre la herramienta."
         )
 
     # ── Tab 1 ────────────────────────────────────────────────────────────────
@@ -550,54 +560,150 @@ class HelpWindow(tk.Toplevel):
     # ── Tab 4 ────────────────────────────────────────────────────────────────
 
     def _section_tab4(self) -> None:
-        self._h1("Tab 4 — Servidor Destino")
-        self._embed_image("tab_04.png", "Tab 4: configuracion del destino del backup")
+        self._h1("Tab 4 — Destino del Backup")
+        self._embed_image("tab_04.png", "Tab 4: seleccion del destino del backup")
 
         self._h2("Proposito")
         self._p(
-            "Define adonde se transfieren los archivos de backup una vez generados en /tmp del servidor origen."
+            "Define adonde se transfieren los archivos de backup (dump de BD y ZIP del filestore) "
+            "una vez generados en /tmp del servidor origen. Hay tres opciones de destino."
         )
 
-        self._h2("Tipos de destino")
-        self._h3("Local (esta maquina)")
-        self._bullet([
-            "Los archivos se descargan a un directorio en la maquina donde corre la herramienta.",
-            "Usa SFTP (paramiko) para la descarga.",
-            "Se puede seleccionar la carpeta destino con el boton '...'.",
-            "Genera el inventario junto al dump en la carpeta local.",
-        ])
-
-        self._h3("Servidor remoto")
-        self._bullet([
-            "Los archivos se transfieren directamente entre servidores via SFTP.",
-            "Se necesita host, puerto, usuario y contrasena/clave del servidor destino.",
-            "El inventario se guarda en el directorio local de inventarios de la herramienta.",
-        ])
-
-        self._h2("Verificacion de espacio en destino")
+        # ── Destino 1: Local ──────────────────────────────────────────────────
+        self._h2("Opcion 1 — Esta maquina (local)")
         self._p(
-            "Antes de cada transferencia, la herramienta verifica el espacio disponible en el destino "
-            "y lo compara con el tamano del archivo a transferir."
+            "Los archivos se descargan a un directorio en la maquina donde corre la herramienta "
+            "usando SFTP (paramiko)."
+        )
+        self._bullet([
+            "Seleccionar carpeta destino con el boton 'Examinar...'.",
+            "El inventario JSON se guarda en la misma carpeta junto al dump.",
+            "Progreso de descarga visible en la barra de progreso de Tab 5.",
+            "Si el archivo ya existe en la carpeta local, aparece el dialogo de sobreescritura.",
+        ])
+        self._ok("Destino recomendado para backups puntuales y acceso inmediato al archivo.")
+
+        # ── Destino 2: Servidor remoto ────────────────────────────────────────
+        self._h2("Opcion 2 — Otro servidor remoto")
+        self._p(
+            "Los archivos se transfieren directamente entre el servidor origen y el servidor destino "
+            "usando sshpass + scp ejecutado en el propio servidor origen. La maquina local "
+            "no necesita tener acceso de red directo al servidor destino."
+        )
+        self._h3("Campos requeridos")
+        self._bullet([
+            "IP / Hostname — direccion del servidor destino.",
+            "Puerto SSH — puerto del servidor destino (defecto 22).",
+            "Usuario — usuario SSH con permisos de escritura en el directorio destino.",
+            "Contrasena — contrasena SSH del usuario en el servidor destino.",
+            "Ruta remota — directorio en el servidor destino donde guardar los archivos (ej. /opt/backups).",
+        ])
+        self._h3("Perfiles guardados")
+        self._p(
+            "Las credenciales del servidor destino se pueden guardar como perfil con nombre "
+            "para reutilizarlas sin volver a escribirlas. Los perfiles se comparten entre "
+            "Tab 1 (origen), Tab 4 (destino) y Tab 6 (restauracion)."
+        )
+        self._note(
+            "La transferencia usa sshpass + scp ejecutado en el servidor ORIGEN, no desde la maquina local. "
+            "Esto permite topologias donde la maquina del usuario no puede alcanzar directamente el servidor destino."
         )
         self._warn(
-            "Si el espacio en destino es insuficiente, la transferencia se cancela con un mensaje "
-            "indicando cuanto hay disponible y cuanto necesita el archivo."
+            "Las contrasenas de perfil se guardan en texto plano en "
+            "~/.odoo_backup_tool/servers.json. No use perfiles en maquinas compartidas."
+        )
+        self._p("Antes de transferir, la herramienta verifica en el servidor destino:")
+        self._bullet([
+            "Que el directorio exista (lo crea con mkdir -p si no existe).",
+            "Que el usuario tenga permisos de escritura.",
+            "Que haya espacio suficiente para el archivo (df -B1).",
+        ])
+
+        # ── Destino 3: Google Drive ───────────────────────────────────────────
+        self._h2("Opcion 3 — Google Drive (Service Account)")
+        self._p(
+            "Los archivos se suben a una carpeta en Google Drive usando autenticacion de "
+            "Service Account de Google Cloud. No requiere interaccion con el navegador ni "
+            "autenticacion OAuth interactiva."
+        )
+        self._h3("Que es una Service Account")
+        self._p(
+            "Una Service Account es una cuenta de servicio de Google Cloud que permite que "
+            "aplicaciones accedan a APIs de Google de forma automatica, sin que un usuario "
+            "humano tenga que iniciar sesion. Se identifica con un archivo JSON que contiene "
+            "sus credenciales (clave privada RSA)."
+        )
+        self._h3("Campos requeridos")
+        self._bullet([
+            "Archivo JSON — ruta al archivo de clave de la Service Account "
+            "(descargado desde Google Cloud Console > IAM > Cuentas de servicio > Claves).",
+            "ID de carpeta — ID de la carpeta en Google Drive donde guardar los backups. "
+            "Se copia del final de la URL de la carpeta: "
+            "drive.google.com/drive/folders/<ID_AQUI>",
+        ])
+        self._h3("Como preparar la Service Account")
+        steps_sa = [
+            "Ir a Google Cloud Console (console.cloud.google.com).",
+            "Crear un proyecto (o usar uno existente) y habilitar la API de Google Drive.",
+            "IAM y administracion > Cuentas de servicio > Crear cuenta de servicio.",
+            "Dar un nombre (ej. odoo-backup-sa) y crear.",
+            "En la cuenta de servicio: pestana 'Claves' > Agregar clave > JSON.",
+            "Descargar el archivo JSON — es el que se ingresa en el campo 'Archivo JSON'.",
+            "Compartir la carpeta de Drive con el email de la Service Account "
+            "(client_email en el JSON) dando permiso 'Editor'.",
+        ]
+        for i, s in enumerate(steps_sa, 1):
+            self._text.insert("end", f"  {i}. ", "bold")
+            self._wl(s, "body")
+
+        self._h3("Boton Verificar conexion")
+        self._p(
+            "Prueba las credenciales y el acceso a la carpeta sin subir ningun archivo. "
+            "Muestra el nombre de la carpeta de destino si la conexion es exitosa."
+        )
+        self._h3("Flujo interno de la transferencia a Drive")
+        steps_drive = [
+            "El dump y el filestore ZIP se generan en /tmp del servidor origen (igual que siempre).",
+            "Cada archivo se descarga del servidor a un directorio temporal local (via SFTP).",
+            "El archivo temporal se sube a Drive con subida resumable (chunked, 5 MB por chunk).",
+            "El archivo temporal local se elimina automaticamente al terminar la subida.",
+            "El inventario JSON se sube a Drive junto con el backup.",
+            "El inventario tambien se guarda localmente en ~/.odoo_backup_tool/inventories/.",
+        ]
+        for i, s in enumerate(steps_drive, 1):
+            self._text.insert("end", f"  {i}. ", "bold")
+            self._wl(s, "body")
+
+        self._note(
+            "La subida a Drive es resumable: si se corta la conexion a internet, la libreria "
+            "de Google retoma el chunk donde se quedo automaticamente."
+        )
+        self._warn(
+            "La clave privada del JSON de Service Account da acceso total a Google Drive. "
+            "Guardela en un lugar seguro y no la suba a repositorios de codigo."
+        )
+        self._h3("Shared Drives (Unidades compartidas)")
+        self._p(
+            "Si el ID ingresado es el de una Shared Drive (unidad compartida de Google Workspace), "
+            "la herramienta busca o crea automaticamente una subcarpeta 'Odoo Backups' dentro "
+            "de esa unidad."
         )
 
+        # ── Sobreescritura ────────────────────────────────────────────────────
         self._h2("Manejo de sobreescritura")
         self._p(
-            "Si ya existe un archivo con el mismo nombre en el destino, aparece un dialogo con tres opciones:"
+            "Para los destinos Local y Servidor remoto, si ya existe un archivo con el mismo "
+            "nombre, aparece un dialogo con tres opciones:"
         )
         self._bullet([
-            "Sobreescribir — el archivo existente se reemplaza completamente (no es un merge, "
-            "es un reemplazo total del contenido en ese path).",
+            "Sobreescribir — el archivo existente se reemplaza completamente.",
             "Renombrar — se agrega un timestamp al nombre del nuevo archivo "
             "(ej. odoo_bancasa_prod_2026-06-30_10-37.sql). El archivo original NO se toca.",
             "Cancelar — se aborta el backup completo.",
         ])
         self._note(
-            "Para los addons (Tab 7), la sobreescritura es diferente: Git opera por hash de commit, "
-            "no por nombre de archivo, por lo que no aplica el concepto de 'sobreescribir'."
+            "En destino Drive no se verifica sobreescritura de nombre: Drive permite multiples "
+            "archivos con el mismo nombre. Si se hacen backups diarios, cada uno crea un archivo nuevo."
         )
 
     # ── Tab 5 ────────────────────────────────────────────────────────────────
@@ -955,11 +1061,16 @@ class HelpWindow(tk.Toplevel):
             "Abrir la herramienta.",
             "Tab 1: ingresar host, puerto y credenciales del servidor de PRODUCCION.",
             "Clic 'Conectar' — verificar que aparecen las BDs disponibles.",
-            "Tab 4: elegir 'Servidor remoto' e ingresar datos del servidor de PRUEBAS.",
+            "Tab 4: elegir el destino del backup:",
         ]
         for i, s in enumerate(steps, 1):
             self._text.insert("end", f"  {i}. ", "bold")
             self._wl(s, "body")
+        self._bullet([
+            "Servidor remoto: ingresar datos del servidor de PRUEBAS.",
+            "Esta maquina: seleccionar carpeta local con 'Examinar...'.",
+            "Google Drive: seleccionar el JSON de Service Account e ID de carpeta.",
+        ])
 
         self._h3("Fase 2 — Backup")
         steps = [
@@ -1082,6 +1193,41 @@ class HelpWindow(tk.Toplevel):
                 "  C:\\Users\\{usuario}\\.odoo_backup_tool\\inventories\\\n"
                 "Esto permite que el boton 'Auto' en Tab 6 los encuentre aunque el dump "
                 "este en el servidor remoto."
+            ),
+            (
+                "Como configuro el destino Google Drive?",
+                "Necesitas tres cosas:\n"
+                "  1. Una Service Account en Google Cloud Console con la API de Drive habilitada.\n"
+                "  2. El archivo JSON de clave de esa Service Account (descargado desde "
+                "     IAM > Cuentas de servicio > Claves > Agregar clave > JSON).\n"
+                "  3. Una carpeta en Google Drive compartida con el email de la Service Account "
+                "     (campo client_email en el JSON) con permiso 'Editor'.\n"
+                "En Tab 4: seleccionar 'Google Drive (Service Account)', cargar el JSON con "
+                "'Examinar...', pegar el ID de la carpeta (de la URL de Drive), "
+                "y usar 'Verificar conexion' para confirmar antes del backup."
+            ),
+            (
+                "La subida a Google Drive se corto a mitad. Se perdio el backup?",
+                "No. La herramienta usa subida resumable (chunked) de la API de Google Drive. "
+                "Si la conexion se interrumpe, la libreria reintenta automaticamente el chunk "
+                "donde se quedo. Sin embargo, si la aplicacion se cierra completamente durante "
+                "la subida, la sesion resumable expira y hay que volver a subir el archivo. "
+                "El archivo en el servidor origen (/tmp) sigue disponible hasta que se limpie."
+            ),
+            (
+                "El destino Google Drive no aparece en Tab 4",
+                "Las librerias de Google no estan instaladas. Ejecuta en el entorno virtual:\n"
+                "  pip install google-api-python-client google-auth google-auth-httplib2\n"
+                "Si usas el ejecutable compilado (.exe), asegurate de recompilar con la "
+                "version que incluye los hidden-imports de Google."
+            ),
+            (
+                "El boton 'Verificar conexion' de Drive da error 404",
+                "El ID de carpeta no existe o la Service Account no tiene acceso. Verifica:\n"
+                "  • Que el ID fue copiado correctamente de la URL de Drive.\n"
+                "  • Que la carpeta en Drive esta compartida con el email de la Service Account "
+                "    (client_email en el JSON) con rol 'Editor' o superior.\n"
+                "  • Que la API de Google Drive esta habilitada en el proyecto de Google Cloud."
             ),
         ]
 
