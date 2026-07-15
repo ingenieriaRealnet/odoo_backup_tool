@@ -32,6 +32,8 @@ from gui.help_window import HelpWindow
 from gui.file_browser_panel import FileBrowserPanel
 from gui.ssh_terminal_panel import SshTerminalPanel
 from core.trial_manager import TrialManager
+from core.scheduler import ScheduleManager, BackupScheduler
+from core.bundle_manager import BundleManager
 
 def _add_timestamp(filename: str) -> str:
     """Insert a timestamp before the file extension: file.dump → file_2026-06-25_14-03.dump"""
@@ -175,6 +177,308 @@ _C_RED      = "#C0392B"   # Stop/danger
 _C_RED2     = "#E74C3C"   # Stop hover
 
 
+class _ScheduleDialog(tk.Toplevel):
+    """
+    Modal dialog for creating or editing a scheduled-backup rule.
+
+    Args:
+        parent:       Parent Tk window.
+        profile_mgr:  ProfileManager instance (to populate server dropdown).
+        rule:         Existing rule dict to edit, or None to create a new one.
+    """
+
+    def __init__(self, parent, profile_mgr, rule: dict | None) -> None:
+        super().__init__(parent)
+        self.title("Regla de backup" if rule is None else "Editar regla de backup")
+        self.resizable(True, True)
+        # No grab_set() — diálogo no modal para que el usuario pueda consultar
+        # otros tabs de la herramienta mientras llena los campos de la regla.
+        self.focus_set()
+
+        self._profile_mgr = profile_mgr
+        self._result: dict | None = None
+
+        # Pre-fill from rule or use defaults
+        r = rule or {}
+        _PAD = 8
+
+        # ── Variables ─────────────────────────────────────────────────────
+        self._v_label        = tk.StringVar(value=r.get("label", ""))
+        self._v_server       = tk.StringVar(value=r.get("server_profile", ""))
+        self._v_db_name      = tk.StringVar(value=r.get("db_name", ""))
+        self._v_db_fmt       = tk.StringVar(value=r.get("db_format", "dump"))
+        self._v_inc_db       = tk.BooleanVar(value=r.get("include_db", True))
+        self._v_inc_fs       = tk.BooleanVar(value=r.get("include_filestore", True))
+        self._v_fs_root      = tk.StringVar(value=r.get("filestore_root", ""))
+        self._v_fs_db        = tk.StringVar(value=r.get("filestore_db", ""))
+        self._v_dest_type    = tk.StringVar(value=r.get("dest_type", "gdrive"))
+        self._v_local_dir    = tk.StringVar(value=r.get("dest_local_dir", ""))
+        self._v_rem_profile  = tk.StringVar(value=r.get("dest_remote_profile", ""))
+        self._v_rem_dir      = tk.StringVar(value=r.get("dest_remote_dir", "/opt/backups"))
+        self._v_gdrive_creds = tk.StringVar(value=r.get("dest_gdrive_creds", ""))
+        self._v_gdrive_folder= tk.StringVar(value=r.get("dest_gdrive_folder_id", ""))
+        self._v_hour         = tk.StringVar(value=str(r.get("schedule_hour", 2)))
+        self._v_minute       = tk.StringVar(value=str(r.get("schedule_minute", 0)))
+        self._v_retention    = tk.StringVar(value=str(r.get("retention_days", 90)))
+        self._v_cleanup      = tk.BooleanVar(value=r.get("cleanup_server", True))
+        self._v_enabled      = tk.BooleanVar(value=r.get("enabled", True))
+
+        # ── Layout ────────────────────────────────────────────────────────
+        self.columnconfigure(0, weight=1)
+        content = ttk.Frame(self, padding=_PAD)
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        row = 0
+
+        # Nombre
+        ttk.Label(content, text="Nombre de la regla:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_label).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        # Habilitado
+        ttk.Checkbutton(content, text="Regla habilitada", variable=self._v_enabled).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=4
+        )
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Servidor
+        ttk.Label(content, text="Servidor (perfil):", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        ttk.Label(content, text="Perfil SSH:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        self._cb_server = ttk.Combobox(
+            content, textvariable=self._v_server,
+            values=profile_mgr.names(), state="readonly",
+        )
+        self._cb_server.grid(row=row, column=1, sticky="ew", pady=4)
+        self._cb_server.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Base de datos
+        ttk.Label(content, text="Base de datos:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        ttk.Label(content, text="Nombre de la BD:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_db_name).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+        ttk.Label(content, text="Formato:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        fmt_frame = ttk.Frame(content)
+        fmt_frame.grid(row=row, column=1, sticky="w")
+        ttk.Radiobutton(fmt_frame, text=".dump (recomendado)", variable=self._v_db_fmt, value="dump").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(fmt_frame, text=".sql (texto plano)", variable=self._v_db_fmt, value="sql").pack(side="left")
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Filestore
+        ttk.Label(content, text="Filestore:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        ttk.Checkbutton(content, text="Incluir dump de BD", variable=self._v_inc_db).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=2
+        )
+        row += 1
+        ttk.Checkbutton(content, text="Incluir filestore", variable=self._v_inc_fs).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=2
+        )
+        row += 1
+        ttk.Label(content, text="Ruta raiz filestore:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_fs_root).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+        ttk.Label(content, text="Carpeta BD filestore:").grid(row=row, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(content, textvariable=self._v_fs_db).grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Destino
+        ttk.Label(content, text="Destino:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        dest_rb_frame = ttk.Frame(content)
+        dest_rb_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(dest_rb_frame, text="Google Drive", variable=self._v_dest_type, value="gdrive",
+                        command=self._toggle_dest).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(dest_rb_frame, text="Local", variable=self._v_dest_type, value="local",
+                        command=self._toggle_dest).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(dest_rb_frame, text="Otro servidor", variable=self._v_dest_type, value="remote",
+                        command=self._toggle_dest).pack(side="left")
+        row += 1
+
+        # Drive panel
+        self._pnl_gdrive = ttk.Frame(content)
+        self._pnl_gdrive.columnconfigure(1, weight=1)
+        ttk.Label(self._pnl_gdrive, text="Credenciales JSON:").grid(row=0, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        _gdrive_row = ttk.Frame(self._pnl_gdrive)
+        _gdrive_row.grid(row=0, column=1, sticky="ew")
+        _gdrive_row.columnconfigure(0, weight=1)
+        ttk.Entry(_gdrive_row, textvariable=self._v_gdrive_creds).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(_gdrive_row, text="...", width=3,
+                   command=lambda: self._v_gdrive_creds.set(
+                       filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("Todos", "*.*")]) or self._v_gdrive_creds.get()
+                   )).grid(row=0, column=1)
+        ttk.Label(self._pnl_gdrive, text="Carpeta Drive (ID):").grid(row=1, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(self._pnl_gdrive, textvariable=self._v_gdrive_folder).grid(row=1, column=1, sticky="ew", pady=4)
+
+        # Local panel
+        self._pnl_local = ttk.Frame(content)
+        self._pnl_local.columnconfigure(1, weight=1)
+        ttk.Label(self._pnl_local, text="Directorio local:").grid(row=0, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        _local_row = ttk.Frame(self._pnl_local)
+        _local_row.grid(row=0, column=1, sticky="ew")
+        _local_row.columnconfigure(0, weight=1)
+        ttk.Entry(_local_row, textvariable=self._v_local_dir).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(_local_row, text="...", width=3,
+                   command=lambda: self._v_local_dir.set(
+                       filedialog.askdirectory(title="Seleccionar directorio destino") or self._v_local_dir.get()
+                   )).grid(row=0, column=1)
+
+        # Remote panel
+        self._pnl_remote = ttk.Frame(content)
+        self._pnl_remote.columnconfigure(1, weight=1)
+        ttk.Label(self._pnl_remote, text="Perfil servidor:").grid(row=0, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Combobox(self._pnl_remote, textvariable=self._v_rem_profile,
+                     values=profile_mgr.names(), state="readonly").grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(self._pnl_remote, text="Directorio destino:").grid(row=1, column=0, sticky="e", padx=(0, _PAD), pady=4)
+        ttk.Entry(self._pnl_remote, textvariable=self._v_rem_dir).grid(row=1, column=1, sticky="ew", pady=4)
+
+        self._dest_row = row
+        self._content = content
+        self._toggle_dest()
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Programacion
+        ttk.Label(content, text="Programacion:", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 2)
+        )
+        row += 1
+        time_frame = ttk.Frame(content)
+        time_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Label(time_frame, text="Hora de ejecucion (HH MM):").pack(side="left", padx=(0, _PAD))
+        ttk.Spinbox(time_frame, textvariable=self._v_hour, from_=0, to=23, width=4, format="%02.0f").pack(side="left", padx=(0, 4))
+        ttk.Label(time_frame, text=":").pack(side="left")
+        ttk.Spinbox(time_frame, textvariable=self._v_minute, from_=0, to=59, width=4, format="%02.0f").pack(side="left", padx=(4, 0))
+        row += 1
+
+        ret_frame = ttk.Frame(content)
+        ret_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Label(ret_frame, text="Retener backups (dias, 0 = sin limite):").pack(side="left", padx=(0, _PAD))
+        ttk.Spinbox(ret_frame, textvariable=self._v_retention, from_=0, to=3650, width=6).pack(side="left")
+        row += 1
+
+        ttk.Separator(content, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # Opciones
+        ttk.Checkbutton(content, text="Limpiar /tmp/ del servidor al terminar", variable=self._v_cleanup).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=4
+        )
+        row += 1
+
+        # Buttons
+        btn_frame = ttk.Frame(self, padding=(_PAD, 0, _PAD, _PAD))
+        btn_frame.grid(row=1, column=0, sticky="ew")
+        ttk.Button(btn_frame, text="Guardar", style="Primary.TButton" if hasattr(ttk.Style(), "theme_use") else "TButton",
+                   command=self._save).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Cancelar", command=self.destroy).pack(side="right", padx=4)
+
+        self.update_idletasks()
+        px = parent.winfo_x() + max(0, (parent.winfo_width()  - self.winfo_width())  // 2)
+        py = parent.winfo_y() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
+        self.geometry(f"+{px}+{py}")
+
+    def _on_profile_selected(self, event=None) -> None:
+        """Auto-fill Drive credentials from the selected server profile."""
+        name = self._v_server.get()
+        p = self._profile_mgr.get(name)
+        if p:
+            if p.get("gdrive_creds_path") and not self._v_gdrive_creds.get():
+                self._v_gdrive_creds.set(p["gdrive_creds_path"])
+            if p.get("gdrive_folder_id") and not self._v_gdrive_folder.get():
+                self._v_gdrive_folder.set(p["gdrive_folder_id"])
+            # Auto-fill filestore root hint (user may need to adjust)
+            if not self._v_fs_root.get():
+                self._v_fs_root.set("/var/lib/odoo/filestore")
+
+    def _toggle_dest(self) -> None:
+        """Show/hide destination sub-panels based on the selected radio."""
+        dest = self._v_dest_type.get()
+        row  = self._dest_row
+        for pnl in (self._pnl_gdrive, self._pnl_local, self._pnl_remote):
+            pnl.grid_remove()
+        if dest == "gdrive":
+            self._pnl_gdrive.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0))
+        elif dest == "local":
+            self._pnl_local.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0))
+        else:
+            self._pnl_remote.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0))
+
+    def _save(self) -> None:
+        """Validate and collect the rule dict from dialog fields."""
+        label   = self._v_label.get().strip()
+        db_name = self._v_db_name.get().strip()
+        if not label:
+            messagebox.showwarning("Validacion", "Ingrese un nombre para la regla.", parent=self)
+            return
+        if not db_name:
+            messagebox.showwarning("Validacion", "Ingrese el nombre de la base de datos.", parent=self)
+            return
+        if not self._v_server.get():
+            messagebox.showwarning("Validacion", "Seleccione un perfil de servidor.", parent=self)
+            return
+        try:
+            hour   = int(self._v_hour.get())
+            minute = int(self._v_minute.get())
+        except ValueError:
+            messagebox.showwarning("Validacion", "Hora o minuto invalidos.", parent=self)
+            return
+
+        self._result = {
+            "label":                self._v_label.get().strip(),
+            "enabled":              self._v_enabled.get(),
+            "server_profile":       self._v_server.get(),
+            "db_name":              db_name,
+            "db_format":            self._v_db_fmt.get(),
+            "include_db":           self._v_inc_db.get(),
+            "include_filestore":    self._v_inc_fs.get(),
+            "filestore_root":       self._v_fs_root.get().strip(),
+            "filestore_db":         self._v_fs_db.get().strip() or db_name,
+            "dest_type":            self._v_dest_type.get(),
+            "dest_local_dir":       self._v_local_dir.get().strip(),
+            "dest_remote_profile":  self._v_rem_profile.get(),
+            "dest_remote_dir":      self._v_rem_dir.get().strip(),
+            "dest_gdrive_creds":    self._v_gdrive_creds.get().strip(),
+            "dest_gdrive_folder_id":self._v_gdrive_folder.get().strip(),
+            "schedule_hour":        hour,
+            "schedule_minute":      minute,
+            "retention_days":       int(self._v_retention.get() or 90),
+            "cleanup_server":       self._v_cleanup.get(),
+        }
+        self.destroy()
+
+    def show(self) -> dict | None:
+        """Block until the dialog closes and return the rule dict or None."""
+        self.wait_window()
+        return self._result
+
+
 class BackupApp:
     """Root window and controller for the Odoo Backup Tool."""
 
@@ -193,6 +497,9 @@ class BackupApp:
         # Persistent connection profiles (loaded from ~/.odoo_backup_tool/servers.json)
         self._profiles = ProfileManager()
 
+        # Schedule rules manager (shared with BackupScheduler)
+        self._sched_mgr = ScheduleManager()
+
         # ── Backup state variables ────────────────────────────────────────
         self._v_db = tk.StringVar()
         self._v_dump_fmt = tk.StringVar(value="dump")
@@ -205,6 +512,19 @@ class BackupApp:
         # Google Drive destination fields
         self._v_gdrive_creds  = tk.StringVar()   # path to service account JSON
         self._v_gdrive_folder = tk.StringVar()   # Drive folder ID
+
+        # Drive fields stored inside the server profile (Tab 1)
+        self._v_prof_gdrive_creds  = tk.StringVar()
+        self._v_prof_gdrive_folder = tk.StringVar()
+
+        # Bundle options (Tab 5)
+        self._v_bundle = tk.BooleanVar(value=True)
+
+        # Restore-from-bundle state (Tab 6)
+        self._v_r_restore_mode  = tk.StringVar(value="individual")   # "bundle" | "individual"
+        self._v_r_bundle_local  = tk.StringVar(value="")
+        self._v_r_bundle_src    = tk.StringVar(value="local")        # "local" | "server"
+        self._v_r_bundle_srv    = tk.StringVar(value="")
 
         # ── Restore state variables ───────────────────────────────────────
         # 'origin' | 'dest' | 'other'
@@ -253,12 +573,24 @@ class BackupApp:
         # Thread -> GUI message queue
         self._q: queue.Queue = queue.Queue()
 
+        # Retry state — set when a transfer fails after files are ready on the server.
+        # Allows re-running only the transfer step with same or different destination.
+        self._retry_remote_tmp:  list[str]   = []
+        self._retry_conn_params: dict        = {}
+        self._retry_dump_path:   str         = ""
+        self._retry_inventory:   dict | None = None
+
         self._build_ui()
         self._poll_queue()
 
         # Kick off the background update check after the UI is ready.
         # The callback schedules the banner display on the main thread via root.after.
         check_for_update(GITHUB_REPO, APP_VERSION, self._on_update_check_result)
+
+        # Start the backup scheduler daemon thread.
+        # It shares self._q so schedule events land in the same poll loop.
+        self._scheduler = BackupScheduler(self._sched_mgr, self._profiles, self._q)
+        self._scheduler.start()
 
     # ── Theme / Style ─────────────────────────────────────────────────────
 
@@ -563,6 +895,7 @@ class BackupApp:
         self._tab_explorer()
         self._tab_terminal()
         self._tab_trial()
+        self._tab_automation()
 
         # Lock backup tabs 2-5 until connected
         for i in range(1, 5):
@@ -916,6 +1249,168 @@ class BackupApp:
         if url:
             webbrowser.open(url)
 
+    # ── Transfer retry ────────────────────────────────────────────────────
+
+    def _show_retry_panel(self, data: dict) -> None:
+        """
+        Reveal the retry panel below the execute buttons.
+
+        Called from the queue handler on a 'transfer_failed' event.
+        Stores retry state so _action_retry_transfer can re-use it.
+        """
+        self._retry_remote_tmp  = data.get("remote_tmp", [])
+        self._retry_conn_params = data.get("conn_params", {})
+        self._retry_dump_path   = data.get("dump_path", "")
+        self._retry_inventory   = data.get("inventory")
+
+        error_msg = data.get("error", "")
+        if error_msg:
+            self._append_log(f"[ERROR] Error durante el traslado: {error_msg}")
+            self._set_status_op("✗ Fallo traslado", color="#C0392B")
+        messagebox.showerror(
+            APP_TITLE,
+            f"El traslado fallo:\n\n{error_msg}\n\n"
+            "Los archivos del servidor siguen disponibles.\n"
+            "Puede reintentar el traslado con el mismo u otro destino."
+        )
+
+        files_text = "\n".join(f"  • {f}" for f in self._retry_remote_tmp) or "(ninguno)"
+        self._lbl_retry_files.config(text=files_text)
+
+        # Grid the retry panel below the progress/button area (row 7)
+        self._frm_retry.grid(
+            row=7, column=0, columnspan=2, sticky="ew",
+            padx=0, pady=(_PAD, 0),
+        )
+        # Scroll to show it if the tab is in a scrollable frame
+        try:
+            self._frm_retry.update_idletasks()
+            self.nb.select(4)  # ensure Tab 5 is visible
+        except Exception:
+            pass
+
+    def _hide_retry_panel(self) -> None:
+        """Hide the retry panel and clear stored retry state."""
+        self._frm_retry.grid_remove()
+        self._retry_remote_tmp  = []
+        self._retry_conn_params = {}
+        self._retry_dump_path   = ""
+        self._retry_inventory   = None
+
+    def _action_retry_transfer(self) -> None:
+        """
+        Re-run only the transfer step using current Tab 4 destination settings.
+
+        The dump / filestore files already exist on the server — only the transfer
+        (and subsequent cleanup + inventory) is repeated.
+        """
+        if not self._retry_remote_tmp:
+            messagebox.showwarning(APP_TITLE, "No hay archivos pendientes de traslado.")
+            return
+
+        # Rebuild params: keep connection info from the original run, but override
+        # destination with whatever is currently selected in Tab 4.
+        p = dict(self._retry_conn_params)
+        p["dest_type"] = self._v_dest_type.get()
+        p["local_dir"] = self._v_local_dir.get()
+
+        if p["dest_type"] == "remote":
+            p["dest_host"] = self._dv["host"].get()
+            p["dest_port"] = self._dv["port"].get()
+            p["dest_user"] = self._dv["user"].get()
+            p["dest_pass"] = self._dv["pass"].get()
+            p["dest_dir"]  = self._dv["dir"].get()
+        elif p["dest_type"] == "gdrive":
+            p["gdrive_creds"]  = self._v_gdrive_creds.get()
+            p["gdrive_folder"] = self._v_gdrive_folder.get()
+
+        # Snapshot retry state BEFORE _hide_retry_panel clears it
+        remote_tmp    = list(self._retry_remote_tmp)
+        dump_path_ret = self._retry_dump_path
+        inventory_ret = self._retry_inventory
+
+        self._hide_retry_panel()
+        self._btn_run.config(state="disabled")
+        self._v_progress.set(0)
+        self._lbl_progress.config(text="")
+        self._begin_operation()
+
+        threading.Thread(
+            target=self._worker_transfer_only,
+            args=(p, remote_tmp, dump_path_ret, inventory_ret),
+            daemon=True,
+        ).start()
+
+    def _action_cleanup_server_retry(self) -> None:
+        """Delete the pending server temp files and close the retry panel."""
+        if not self._retry_remote_tmp:
+            self._hide_retry_panel()
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "Esto eliminará los archivos del servidor sin transferirlos:\n\n"
+            + "\n".join(f"  • {f}" for f in self._retry_remote_tmp)
+            + "\n\n¿Continuar?",
+        ):
+            return
+
+        db_mgr = DBManager(self._ssh)
+        for path in self._retry_remote_tmp:
+            try:
+                self._log(f"Limpiando {path} del servidor ...")
+                db_mgr.cleanup_remote(path)
+            except Exception as exc:
+                self._log(f"[aviso] No se pudo limpiar {path}: {exc}")
+
+        self._hide_retry_panel()
+        self._log("Archivos del servidor eliminados.")
+
+    def _worker_transfer_only(
+        self,
+        p: dict,
+        remote_tmp: list[str],
+        dump_path: str,
+        inventory: dict | None,
+    ) -> None:
+        """
+        Background worker that runs only the transfer step (Steps 3-5).
+
+        Used by the retry flow when files are already on the server and only
+        the destination needs to be re-attempted.
+        """
+        n    = max(len(remote_tmp), 1)
+        step = [0]
+
+        def advance_fn(label: str) -> None:
+            step[0] += 1
+            pct = min(int(step[0] / n * 90), 90)
+            self._q.put(("progress", (pct, label)))
+
+        try:
+            self._exec_transfer_and_finish(p, remote_tmp, dump_path, inventory, advance_fn)
+
+        except RuntimeError as exc:
+            if str(exc) == "__CANCELLED__":
+                self._q.put(("cancelled", "Traslado detenido por el usuario."))
+            else:
+                self._q.put(("transfer_failed", {
+                    "remote_tmp":  remote_tmp,
+                    "dump_path":   dump_path,
+                    "inventory":   inventory,
+                    "conn_params": p,
+                    "error":       str(exc),
+                }))
+                self._q.put(("btn_enable", None))
+        except Exception as exc:
+            self._q.put(("transfer_failed", {
+                "remote_tmp":  remote_tmp,
+                "dump_path":   dump_path,
+                "inventory":   inventory,
+                "conn_params": p,
+                "error":       str(exc),
+            }))
+            self._q.put(("btn_enable", None))
+
     # ── Shared helper ────────────────────────────────────────────────────
 
     def _scrollable_tab(self, tab_text: str) -> ttk.Frame:
@@ -988,6 +1483,42 @@ class BackupApp:
             pnl_prof, text="Eliminar",
             command=self._delete_profile,
         ).grid(row=0, column=2, padx=2)
+
+        # Drive config fields inside the profile panel (for automation)
+        pnl_prof.columnconfigure(1, weight=1)
+        ttk.Separator(pnl_prof, orient="horizontal").grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(_PAD, 4)
+        )
+        ttk.Label(pnl_prof, text="Google Drive (automatizacion):",
+                  font=("Segoe UI", 8, "bold")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(0, 2)
+        )
+        ttk.Label(pnl_prof, text="Credenciales JSON:").grid(
+            row=3, column=0, sticky="e", padx=(0, _PAD), pady=2
+        )
+        _prof_creds_row = ttk.Frame(pnl_prof)
+        _prof_creds_row.grid(row=3, column=1, columnspan=2, sticky="ew", pady=2)
+        _prof_creds_row.columnconfigure(0, weight=1)
+        ttk.Entry(_prof_creds_row, textvariable=self._v_prof_gdrive_creds).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(
+            _prof_creds_row, text="...",
+            command=lambda: self._v_prof_gdrive_creds.set(
+                filedialog.askopenfilename(
+                    title="Seleccionar credenciales de Drive",
+                    filetypes=[("JSON", "*.json"), ("Todos", "*.*")],
+                ) or self._v_prof_gdrive_creds.get()
+            ),
+            width=3,
+        ).grid(row=0, column=1)
+
+        ttk.Label(pnl_prof, text="Carpeta Drive (ID):").grid(
+            row=4, column=0, sticky="e", padx=(0, _PAD), pady=2
+        )
+        ttk.Entry(pnl_prof, textvariable=self._v_prof_gdrive_folder).grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=2
+        )
 
         # Connection fields — Servidor A
         self._cv: dict[str, tk.StringVar] = {
@@ -1349,6 +1880,7 @@ class BackupApp:
         ttk.Checkbutton(opt, text="Incluir dump de BD", variable=self._v_inc_db).pack(side="left", padx=_PAD)
         ttk.Checkbutton(opt, text="Incluir filestore", variable=self._v_inc_fs).pack(side="left", padx=_PAD)
         ttk.Checkbutton(opt, text="Limpiar /tmp/ al terminar", variable=self._v_cleanup).pack(side="left", padx=_PAD)
+        ttk.Checkbutton(opt, text="Crear bundle unificado (.tar)", variable=self._v_bundle).pack(side="left", padx=_PAD)
 
         # Progress
         ttk.Label(f, text="Progreso:").grid(row=3, column=0, sticky="w", pady=(_PAD, 2))
@@ -1371,6 +1903,81 @@ class BackupApp:
             style="Stop.TButton", command=self._action_stop,
         )
         self._btn_stop_backup.pack(side="left", padx=6)
+
+        # ── Retry panel (hidden; shown when a transfer fails after files are ready) ──
+        self._frm_retry = tk.LabelFrame(
+            f, text="  Reanudar traslado  ",
+            font=("Segoe UI", 9, "bold"),
+            bg="#FFF3CD", fg="#664D03",
+            bd=1, relief="solid", padx=10, pady=8,
+        )
+        # Not gridded yet — _show_retry_panel() calls grid() when needed.
+
+        tk.Label(
+            self._frm_retry,
+            text="⚠  El traslado fallo pero los archivos siguen disponibles en el servidor.",
+            font=("Segoe UI", 9, "bold"),
+            bg="#FFF3CD", fg="#664D03",
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        tk.Label(
+            self._frm_retry,
+            text="Archivos listos:",
+            font=("Segoe UI", 8),
+            bg="#FFF3CD", fg="#664D03",
+        ).grid(row=1, column=0, sticky="nw", padx=(0, 6))
+
+        self._lbl_retry_files = tk.Label(
+            self._frm_retry,
+            text="",
+            font=("Consolas", 8),
+            bg="#FFF3CD", fg="#3D2B02",
+            justify="left", anchor="w",
+        )
+        self._lbl_retry_files.grid(row=1, column=1, sticky="w")
+
+        tk.Label(
+            self._frm_retry,
+            text="Cambia el destino en Tab 4 si lo necesitas, luego haz clic en Reintentar.",
+            font=("Segoe UI", 8, "italic"),
+            bg="#FFF3CD", fg="#664D03",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 4))
+
+        retry_btns = tk.Frame(self._frm_retry, bg="#FFF3CD")
+        retry_btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        tk.Button(
+            retry_btns,
+            text=" ↺  Reintentar traslado ",
+            font=("Segoe UI", 9, "bold"),
+            bg="#664D03", fg="white",
+            activebackground="#3D2B02", activeforeground="white",
+            relief="flat", cursor="hand2", padx=8, pady=4,
+            command=self._action_retry_transfer,
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            retry_btns,
+            text=" ⇆  Ir a Tab 4 (cambiar destino) ",
+            font=("Segoe UI", 9),
+            bg="#856404", fg="white",
+            activebackground="#664D03", activeforeground="white",
+            relief="flat", cursor="hand2", padx=8, pady=4,
+            command=lambda: self.nb.select(3),
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            retry_btns,
+            text=" ✕  Limpiar archivos del servidor ",
+            font=("Segoe UI", 9),
+            bg="#6c757d", fg="white",
+            activebackground="#495057", activeforeground="white",
+            relief="flat", cursor="hand2", padx=8, pady=4,
+            command=self._action_cleanup_server_retry,
+        ).pack(side="left")
+
+        self._frm_retry.columnconfigure(1, weight=1)
 
         f.columnconfigure(0, weight=1)
 
@@ -1530,22 +2137,36 @@ class BackupApp:
             self._cv["port"].set(str(p["port"]))
             self._cv["user"].set(p["user"])
             self._cv["pass"].set(p["password"])
+            self._v_prof_gdrive_creds.set(p.get("gdrive_creds_path", ""))
+            self._v_prof_gdrive_folder.set(p.get("gdrive_folder_id", ""))
 
     def _save_profile(self) -> None:
-        """Save current Tab-1 connection fields as a named profile."""
+        """Save current Tab-1 connection fields as a named profile.
+
+        If a profile is already selected, updates it directly (no name prompt).
+        If nothing is selected, asks for a name to create a new profile.
+        """
         host = self._cv["host"].get().strip()
         if not host:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
-        default_name = f"{self._cv['user'].get()}@{host}:{self._cv['port'].get()}"
-        name = simpledialog.askstring(
-            "Guardar perfil",
-            "Nombre del perfil:",
-            initialvalue=self._cb_profile.get() or default_name,
-            parent=self.root,
-        )
-        if not name:
-            return
+        existing = self._cb_profile.get()
+        if existing:
+            # Editing an existing profile — confirm and overwrite directly
+            if not messagebox.askyesno(
+                APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
+            ):
+                return
+            name = existing
+        else:
+            # New profile — ask for a name
+            default_name = f"{self._cv['user'].get()}@{host}:{self._cv['port'].get()}"
+            name = simpledialog.askstring(
+                "Nuevo perfil", "Nombre del perfil:",
+                initialvalue=default_name, parent=self.root,
+            )
+            if not name:
+                return
         try:
             self._profiles.save(
                 name=name,
@@ -1553,6 +2174,8 @@ class BackupApp:
                 port=int(self._cv["port"].get() or 22),
                 user=self._cv["user"].get(),
                 password=self._cv["pass"].get(),
+                gdrive_creds_path=self._v_prof_gdrive_creds.get(),
+                gdrive_folder_id=self._v_prof_gdrive_folder.get(),
             )
             self._refresh_profile_combos()
             self._cb_profile.set(name)
@@ -1586,20 +2209,29 @@ class BackupApp:
             # Keep 'dir' as-is — it's specific to backup paths, not the server profile
 
     def _save_d_profile(self) -> None:
-        """Save current Tab-4 destination fields as a named profile."""
+        """Save current Tab-4 destination fields as a named profile.
+
+        Updates the selected profile directly; asks for name only when creating new.
+        """
         host = self._dv["host"].get().strip()
         if not host:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
-        default_name = f"{self._dv['user'].get()}@{host}:{self._dv['port'].get()}"
-        name = simpledialog.askstring(
-            "Guardar perfil",
-            "Nombre del perfil:",
-            initialvalue=self._cb_d_profile.get() or default_name,
-            parent=self.root,
-        )
-        if not name:
-            return
+        existing = self._cb_d_profile.get()
+        if existing:
+            if not messagebox.askyesno(
+                APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
+            ):
+                return
+            name = existing
+        else:
+            default_name = f"{self._dv['user'].get()}@{host}:{self._dv['port'].get()}"
+            name = simpledialog.askstring(
+                "Nuevo perfil", "Nombre del perfil:",
+                initialvalue=default_name, parent=self.root,
+            )
+            if not name:
+                return
         try:
             self._profiles.save(
                 name=name,
@@ -1639,23 +2271,32 @@ class BackupApp:
             self._r_conn_vars["pass"].set(p["password"])
 
     def _save_r_profile(self) -> None:
-        """Save current restore 'otro servidor' fields as a named profile."""
+        """Save current restore 'otro servidor' fields as a named profile.
+
+        Updates the selected profile directly; asks for name only when creating new.
+        """
         host = self._r_conn_vars["host"].get().strip()
         if not host:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
-        default_name = (
-            f"{self._r_conn_vars['user'].get()}@{host}:"
-            f"{self._r_conn_vars['port'].get()}"
-        )
-        name = simpledialog.askstring(
-            "Guardar perfil",
-            "Nombre del perfil:",
-            initialvalue=self._cb_r_profile.get() or default_name,
-            parent=self.root,
-        )
-        if not name:
-            return
+        existing = self._cb_r_profile.get()
+        if existing:
+            if not messagebox.askyesno(
+                APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
+            ):
+                return
+            name = existing
+        else:
+            default_name = (
+                f"{self._r_conn_vars['user'].get()}@{host}:"
+                f"{self._r_conn_vars['port'].get()}"
+            )
+            name = simpledialog.askstring(
+                "Nuevo perfil", "Nombre del perfil:",
+                initialvalue=default_name, parent=self.root,
+            )
+            if not name:
+                return
         try:
             self._profiles.save(
                 name=name,
@@ -2036,6 +2677,7 @@ class BackupApp:
             "inc_db": self._v_inc_db.get(),
             "inc_fs": self._v_inc_fs.get(),
             "cleanup": self._v_cleanup.get(),
+            "bundle": self._v_bundle.get(),
         }
         if params["dest_type"] == "remote":
             params["dest_host"] = self._dv["host"].get()
@@ -2071,7 +2713,9 @@ class BackupApp:
         remote_tmp: list[str] = []
         inventory: dict | None = None
         final_dump_fname: str = ""   # resolved after overwrite dialog
+        dump_path: str = ""          # set only when inc_db=True
 
+        # ── Phase A: create files on the server (not retryable) ──────────
         try:
             # ── 0. Collect inventory BEFORE dump starts ───────────────────
             # Read-only queries — safe while Odoo is still running.
@@ -2142,164 +2786,229 @@ class BackupApp:
                 remote_tmp.append(fs_path)
                 advance(f"Filestore comprimido: {fs_path}")
 
-            # ── 3. Transfer each file
-            # For Google Drive: a shared DriveUploader is built once per backup run.
-            gdrive_uploader = (
-                DriveUploader(p["gdrive_creds"], p["gdrive_folder"])
-                if p["dest_type"] == "gdrive"
-                else None
-            )
+        except RuntimeError as exc:
+            if str(exc) == "__CANCELLED__":
+                self._q.put(("cancelled", "Backup detenido por el usuario."))
+            else:
+                self._q.put(("error", f"Error creando backup: {exc}"))
+                self._q.put(("btn_enable", None))
+            return
+        except Exception as exc:
+            self._q.put(("error", f"Error creando backup: {exc}"))
+            self._q.put(("btn_enable", None))
+            return
 
-            for remote_file in remote_tmp:
-                fname = os.path.basename(remote_file)
+        # ── Bundle step: pack dump + filestore + inventory into one .tar ──
+        # Only when bundle=True and there is at least one file to pack.
+        if p.get("bundle", True) and remote_tmp:
+            try:
+                bm = BundleManager(self._ssh)
+                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+                bundle_name = BundleManager.bundle_name_for(p["db"], ts)
+                bundle_path_remote = f"/tmp/{bundle_name}"
 
-                if p["dest_type"] == "local":
-                    # Check if file already exists locally before downloading
-                    if transfer.local_file_exists(p["local_dir"], fname):
-                        action, fname = self._ask_overwrite(fname, p["local_dir"])
-                        if action == "cancel":
-                            self._log("Backup cancelado por el usuario.")
-                            self._q.put(("btn_enable", None))
-                            return
+                # Write inventory JSON to server so it travels inside the bundle
+                inv_remote_path = None
+                if inventory:
+                    inv_json_name   = f"{p['db']}_{ts}_inventory.json"
+                    inv_remote_path = f"/tmp/{inv_json_name}"
+                    bm.write_json_to_server(inventory, inv_remote_path)
+                    self._log(f"Inventario escrito en servidor: {inv_remote_path}")
 
-                    def _prog(transferred: int, total: int, _f: str = fname) -> None:
-                        pct = (transferred / total * 100) if total else 0
-                        self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
+                all_files = remote_tmp + ([inv_remote_path] if inv_remote_path else [])
+                bm.create(bundle_path_remote, all_files, log_callback=self._log)
 
-                    transfer.download_to_local(
-                        remote_file, p["local_dir"],
-                        dest_filename=fname,
-                        progress_callback=_prog,
-                        log_callback=self._log,
-                    )
+                # Remove individual files — they are now inside the .tar
+                db_mgr_cleanup = DBManager(self._ssh)
+                for f in all_files:
+                    db_mgr_cleanup.cleanup_remote(f)
 
-                elif p["dest_type"] == "remote":
-                    # Check if file already exists on the remote destination
-                    if transfer.remote_file_exists(
-                        p["dest_host"], int(p["dest_port"]),
-                        p["dest_user"], p["dest_pass"],
-                        p["dest_dir"], fname,
-                    ):
-                        action, fname = self._ask_overwrite(
-                            fname, f"{p['dest_host']}:{p['dest_dir']}"
-                        )
-                        if action == "cancel":
-                            self._log("Backup cancelado por el usuario.")
-                            self._q.put(("btn_enable", None))
-                            return
+                # Replace the file list with just the single bundle
+                remote_tmp = [bundle_path_remote]
+                dump_path  = bundle_path_remote   # used for inventory naming in _exec_transfer_and_finish
+                inventory  = None                 # already inside the bundle — skip Step 5
 
-                    transfer.transfer_to_server(
-                        remote_file,
-                        p["dest_host"],
-                        int(p["dest_port"]),
-                        p["dest_user"],
-                        p["dest_pass"],
-                        p["dest_dir"],
-                        dest_filename=fname,
-                        log_callback=self._log,
-                    )
+            except Exception as exc_bundle:
+                # Non-fatal: fall back to transferring individual files
+                self._log(f"[aviso] No se pudo crear el bundle, se transferiran archivos individuales: {exc_bundle}")
 
-                else:
-                    # ── Google Drive: download to local temp, then upload to Drive ──
-                    # The tool never stores the file permanently on the local machine;
-                    # the temp file is deleted as soon as the Drive upload finishes.
-                    tmp_dir = tempfile.mkdtemp(prefix="odoo_bkp_drive_")
-                    try:
-                        def _prog_dl(transferred: int, total: int, _f: str = fname) -> None:
-                            pct = (transferred / total * 100) if total else 0
-                            self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
-
-                        local_tmp = transfer.download_to_local(
-                            remote_file, tmp_dir,
-                            dest_filename=fname,
-                            progress_callback=_prog_dl,
-                            log_callback=self._log,
-                        )
-
-                        def _prog_up(uploaded: int, total: int, _f: str = fname) -> None:
-                            pct = (uploaded / total * 100) if total else 0
-                            self._q.put(("progress", (pct, f"Subiendo {_f} a Drive ... {pct:.0f}%")))
-
-                        gdrive_uploader.upload_file(
-                            local_tmp,
-                            dest_filename=fname,
-                            progress_callback=_prog_up,
-                            log_callback=self._log,
-                        )
-                    finally:
-                        # Always clean up the local temp file
-                        try:
-                            if os.path.exists(os.path.join(tmp_dir, fname)):
-                                os.remove(os.path.join(tmp_dir, fname))
-                            os.rmdir(tmp_dir)
-                        except OSError:
-                            pass
-
-                # Update final_dump_fname with the resolved name AFTER the overwrite
-                # dialog — fname may have been renamed with a timestamp at this point.
-                # This ensures the companion inventory is saved with the same name
-                # as the actual dump file on disk so auto-detect can find it.
-                if remote_file == dump_path:
-                    final_dump_fname = fname
-
-                advance(f"Transferido: {fname}")
-
-            # ── 4. Remote cleanup
-            if p["cleanup"]:
-                for remote_file in remote_tmp:
-                    self._log(f"Limpiando {remote_file} del servidor ...")
-                    db_mgr.cleanup_remote(remote_file)
-
-            # ── 5. Save inventory alongside the backup files ──────────────
-            # The inventory JSON acts as a validation baseline for future restores.
-            # Naming: {dump_base}_inventory.json  (paired with the dump filename).
-            if inventory and final_dump_fname:
-                inv_base = os.path.splitext(final_dump_fname)[0]
-                inv_filename = f"{inv_base}_inventory.json"
-                try:
-                    if p["dest_type"] == "local":
-                        # Save next to the downloaded dump files
-                        inv_local = os.path.join(p["local_dir"], inv_filename)
-                        InventoryManager.save(inventory, inv_local)
-                        self._log(f"Inventario guardado: {inv_local}")
-                    elif p["dest_type"] == "gdrive":
-                        # Save locally first, then upload to Drive alongside the backup
-                        inv_local = os.path.join(
-                            InventoryManager.local_inventory_dir(), inv_filename
-                        )
-                        InventoryManager.save(inventory, inv_local)
-                        self._log(f"Inventario guardado localmente: {inv_local}")
-                        try:
-                            gdrive_uploader.upload_file(
-                                inv_local,
-                                dest_filename=inv_filename,
-                                log_callback=self._log,
-                            )
-                        except Exception as exc_inv:
-                            self._log(f"[aviso] No se pudo subir el inventario a Drive: {exc_inv}")
-                    else:
-                        # For remote destinations, keep a local copy in the
-                        # inventories folder so the user can find it later
-                        # when selecting the restore source from this machine.
-                        inv_local = os.path.join(
-                            InventoryManager.local_inventory_dir(), inv_filename
-                        )
-                        InventoryManager.save(inventory, inv_local)
-                        self._log(f"Inventario guardado localmente: {inv_local}")
-                except Exception as exc:
-                    self._log(f"[aviso] No se pudo guardar el inventario: {exc}")
-
-            self._q.put(("done", "Backup completado exitosamente."))
+        # ── Phase B: transfer (retryable — files are on the server) ─────
+        # Any error here shows the retry panel so the user can change the
+        # destination and re-run the transfer without recreating the dump/zip.
+        try:
+            self._exec_transfer_and_finish(p, remote_tmp, dump_path, inventory, advance)
 
         except RuntimeError as exc:
             if str(exc) == "__CANCELLED__":
                 self._q.put(("cancelled", "Backup detenido por el usuario."))
             else:
-                self._q.put(("error", f"Error durante el backup: {exc}"))
+                self._q.put(("transfer_failed", {
+                    "remote_tmp": list(remote_tmp),
+                    "dump_path":  dump_path,
+                    "inventory":  inventory,
+                    "conn_params": p,
+                    "error": str(exc),
+                }))
                 self._q.put(("btn_enable", None))
         except Exception as exc:
-            self._q.put(("error", f"Error durante el backup: {exc}"))
+            self._q.put(("transfer_failed", {
+                "remote_tmp":  list(remote_tmp),
+                "dump_path":   dump_path,
+                "inventory":   inventory,
+                "conn_params": p,
+                "error":       str(exc),
+            }))
             self._q.put(("btn_enable", None))
+
+    def _exec_transfer_and_finish(
+        self,
+        p: dict,
+        remote_tmp: list[str],
+        dump_path: str,
+        inventory: dict | None,
+        advance_fn,
+    ) -> None:
+        """
+        Steps 3-5: transfer files to destination, server cleanup, save inventory.
+
+        Raises RuntimeError / Exception on failure — callers wrap this in try/except
+        and decide whether to show the retry panel or report a fatal error.
+
+        Args:
+            p:           Full backup params dict (dest_type, connection info, etc.).
+            remote_tmp:  List of absolute paths on the source server ready to transfer.
+            dump_path:   Path of the DB dump on the server (used to name the inventory).
+            inventory:   Inventory dict collected before the dump, or None.
+            advance_fn:  Callable(label) that increments the progress bar step counter.
+        """
+        db_mgr   = DBManager(self._ssh)
+        transfer = TransferManager(self._ssh)
+
+        # ── 3. Transfer each file ─────────────────────────────────────────
+        final_dump_fname: str = ""
+        gdrive_uploader = (
+            DriveUploader(p["gdrive_creds"], p["gdrive_folder"])
+            if p["dest_type"] == "gdrive"
+            else None
+        )
+
+        for remote_file in remote_tmp:
+            fname = os.path.basename(remote_file)
+
+            if p["dest_type"] == "local":
+                if transfer.local_file_exists(p["local_dir"], fname):
+                    action, fname = self._ask_overwrite(fname, p["local_dir"])
+                    if action == "cancel":
+                        self._log("Backup cancelado por el usuario.")
+                        self._q.put(("btn_enable", None))
+                        return
+
+                def _prog(transferred: int, total: int, _f: str = fname) -> None:
+                    pct = (transferred / total * 100) if total else 0
+                    self._q.put(("progress", (pct, f"Descargando {_f} ... {pct:.0f}%")))
+
+                transfer.download_to_local(
+                    remote_file, p["local_dir"],
+                    dest_filename=fname,
+                    progress_callback=_prog,
+                    log_callback=self._log,
+                )
+
+            elif p["dest_type"] == "remote":
+                if transfer.remote_file_exists(
+                    p["dest_host"], int(p["dest_port"]),
+                    p["dest_user"], p["dest_pass"],
+                    p["dest_dir"], fname,
+                ):
+                    action, fname = self._ask_overwrite(
+                        fname, f"{p['dest_host']}:{p['dest_dir']}"
+                    )
+                    if action == "cancel":
+                        self._log("Backup cancelado por el usuario.")
+                        self._q.put(("btn_enable", None))
+                        return
+
+                transfer.transfer_to_server(
+                    remote_file,
+                    p["dest_host"],
+                    int(p["dest_port"]),
+                    p["dest_user"],
+                    p["dest_pass"],
+                    p["dest_dir"],
+                    dest_filename=fname,
+                    log_callback=self._log,
+                )
+
+            else:
+                # ── Google Drive: stream directly SFTP → Drive (no local disk) ──
+                total_size = transfer.get_remote_file_size(remote_file)
+                sftp_session, sftp_file = transfer.open_remote_file(remote_file)
+                try:
+                    def _prog_up(uploaded: int, total: int, _f: str = fname) -> None:
+                        pct = (uploaded / total * 100) if total else 0
+                        self._q.put(("progress", (pct, f"Drive streaming {_f} ... {pct:.0f}%")))
+
+                    gdrive_uploader.upload_stream(
+                        sftp_file,
+                        filename=fname,
+                        total_size=total_size,
+                        progress_callback=_prog_up,
+                        log_callback=self._log,
+                    )
+                finally:
+                    try:
+                        sftp_file.close()
+                    except Exception:
+                        pass
+                    try:
+                        sftp_session.close()
+                    except Exception:
+                        pass
+
+            if remote_file == dump_path:
+                final_dump_fname = fname
+
+            advance_fn(f"Transferido: {fname}")
+
+        # ── 4. Remote cleanup ─────────────────────────────────────────────
+        if p.get("cleanup", True):
+            for remote_file in remote_tmp:
+                self._log(f"Limpiando {remote_file} del servidor ...")
+                db_mgr.cleanup_remote(remote_file)
+
+        # ── 5. Save inventory ─────────────────────────────────────────────
+        if inventory and final_dump_fname:
+            inv_base     = os.path.splitext(final_dump_fname)[0]
+            inv_filename = f"{inv_base}_inventory.json"
+            try:
+                if p["dest_type"] == "local":
+                    inv_local = os.path.join(p["local_dir"], inv_filename)
+                    InventoryManager.save(inventory, inv_local)
+                    self._log(f"Inventario guardado: {inv_local}")
+                elif p["dest_type"] == "gdrive":
+                    inv_local = os.path.join(
+                        InventoryManager.local_inventory_dir(), inv_filename
+                    )
+                    InventoryManager.save(inventory, inv_local)
+                    self._log(f"Inventario guardado localmente: {inv_local}")
+                    try:
+                        gdrive_uploader.upload_file(
+                            inv_local,
+                            dest_filename=inv_filename,
+                            log_callback=self._log,
+                        )
+                    except Exception as exc_inv:
+                        self._log(f"[aviso] No se pudo subir el inventario a Drive: {exc_inv}")
+                else:
+                    inv_local = os.path.join(
+                        InventoryManager.local_inventory_dir(), inv_filename
+                    )
+                    InventoryManager.save(inventory, inv_local)
+                    self._log(f"Inventario guardado localmente: {inv_local}")
+            except Exception as exc:
+                self._log(f"[aviso] No se pudo guardar el inventario: {exc}")
+
+        self._q.put(("done", "Backup completado exitosamente."))
 
     def _action_stop(self) -> None:
         """Signal the running backup, restore, or addons-sync to stop."""
@@ -2445,6 +3154,9 @@ class BackupApp:
 
                 elif event == "btn_enable":
                     self._btn_run.config(state="normal")
+
+                elif event == "transfer_failed":
+                    self._show_retry_panel(data)
 
                 elif event == "ask_overwrite":
                     filename, dest_desc, ev, result = data
@@ -2596,6 +3308,14 @@ class BackupApp:
                 elif event == "btn_addons_enable":
                     self._btn_sync_addons.config(state="normal")
 
+                # ── Scheduler events ──────────────────────────────────────
+                elif event == "sched_refresh":
+                    self._sched_refresh_tree(data)
+
+                elif event == "sched_log":
+                    rule_id, message = data
+                    self._append_log(message)
+
         except queue.Empty:
             pass
 
@@ -2735,72 +3455,130 @@ class BackupApp:
         sec2.columnconfigure(1, weight=1)
         row += 1
 
+        # ── Modo bundle (opcion prioritaria) ────────────────────────────
+        ttk.Label(sec2, text="Modo de restauracion:", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
+        rb_bundle = ttk.Radiobutton(
+            sec2, text="Desde bundle unificado OBT (.tar)  —  recomendado",
+            variable=self._v_r_restore_mode, value="bundle",
+            command=self._toggle_restore_mode,
+        )
+        rb_bundle.grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(
+            sec2, text="Archivos individuales",
+            variable=self._v_r_restore_mode, value="individual",
+            command=self._toggle_restore_mode,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, _PAD))
+
+        # Bundle path panel
+        self._pnl_bundle = ttk.Frame(sec2)
+        self._pnl_bundle.columnconfigure(1, weight=1)
+        ttk.Radiobutton(
+            self._pnl_bundle, text="Archivo local:",
+            variable=self._v_r_bundle_src, value="local",
+            command=self._toggle_bundle_src,
+        ).grid(row=0, column=0, sticky="w")
+        self._r_bundle_local_entry = ttk.Entry(
+            self._pnl_bundle, textvariable=self._v_r_bundle_local, width=38
+        )
+        self._r_bundle_local_entry.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(
+            self._pnl_bundle, text="...", width=3,
+            command=lambda: self._v_r_bundle_local.set(
+                filedialog.askopenfilename(
+                    title="Seleccionar bundle OBT",
+                    filetypes=[("Bundle OBT", "*.tar"), ("Todos", "*.*")],
+                ) or self._v_r_bundle_local.get()
+            ),
+        ).grid(row=0, column=2)
+        ttk.Radiobutton(
+            self._pnl_bundle, text="Ya en servidor:",
+            variable=self._v_r_bundle_src, value="server",
+            command=self._toggle_bundle_src,
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self._r_bundle_srv_entry = ttk.Entry(
+            self._pnl_bundle, textvariable=self._v_r_bundle_srv, width=38, state="disabled"
+        )
+        self._r_bundle_srv_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(2, 0))
+        self._pnl_bundle.grid(row=3, column=0, columnspan=3, sticky="ew", padx=(20, 0), pady=(0, _PAD))
+
+        # Separator between modes
+        ttk.Separator(sec2, orient="horizontal").grid(
+            row=4, column=0, columnspan=3, sticky="ew", pady=(0, _PAD)
+        )
+
+        # Individual-file panel (the original sec2 content, now grouped)
+        self._pnl_individual = ttk.Frame(sec2)
+        self._pnl_individual.columnconfigure(1, weight=1)
+
         # Dump file
-        ttk.Label(sec2, text="Dump de BD:", font=("Segoe UI", 9, "bold")).grid(
+        ttk.Label(self._pnl_individual, text="Dump de BD:", font=("Segoe UI", 9, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
         ttk.Radiobutton(
-            sec2, text="Archivo local:", variable=self._v_r_dump_src, value="local",
+            self._pnl_individual, text="Archivo local:", variable=self._v_r_dump_src, value="local",
             command=self._toggle_dump_src,
         ).grid(row=1, column=0, sticky="w")
-        self._r_dump_local_entry = ttk.Entry(sec2, textvariable=self._v_r_dump_local, width=38)
+        pi = self._pnl_individual   # shorthand
+        self._r_dump_local_entry = ttk.Entry(pi, textvariable=self._v_r_dump_local, width=38)
         self._r_dump_local_entry.grid(row=1, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(sec2, text="...", width=3,
+        ttk.Button(pi, text="...", width=3,
             command=lambda: self._browse_file(self._v_r_dump_local, "*.dump *.sql")
         ).grid(row=1, column=2)
 
         ttk.Radiobutton(
-            sec2, text="Ya en servidor:", variable=self._v_r_dump_src, value="server",
+            pi, text="Ya en servidor:", variable=self._v_r_dump_src, value="server",
             command=self._toggle_dump_src,
         ).grid(row=2, column=0, sticky="w", pady=(2, 0))
-        self._r_dump_srv_entry = ttk.Entry(sec2, textvariable=self._v_r_dump_srv, width=38, state="disabled")
+        self._r_dump_srv_entry = ttk.Entry(pi, textvariable=self._v_r_dump_srv, width=38, state="disabled")
         self._r_dump_srv_entry.grid(row=2, column=1, sticky="ew", padx=(4, 4))
 
-        ttk.Separator(sec2, orient="horizontal").grid(
+        ttk.Separator(pi, orient="horizontal").grid(
             row=3, column=0, columnspan=3, sticky="ew", pady=_PAD
         )
 
         # Filestore zip
-        ttk.Label(sec2, text="Filestore ZIP:", font=("Segoe UI", 9, "bold")).grid(
+        ttk.Label(pi, text="Filestore ZIP:", font=("Segoe UI", 9, "bold")).grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(0, 2)
         )
         ttk.Radiobutton(
-            sec2, text="Archivo local:", variable=self._v_r_fs_src, value="local",
+            pi, text="Archivo local:", variable=self._v_r_fs_src, value="local",
             command=self._toggle_fs_src,
         ).grid(row=5, column=0, sticky="w")
-        self._r_fs_local_entry = ttk.Entry(sec2, textvariable=self._v_r_fs_local, width=38)
+        self._r_fs_local_entry = ttk.Entry(pi, textvariable=self._v_r_fs_local, width=38)
         self._r_fs_local_entry.grid(row=5, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(sec2, text="...", width=3,
+        ttk.Button(pi, text="...", width=3,
             command=lambda: self._browse_file(self._v_r_fs_local, "*.zip")
         ).grid(row=5, column=2)
 
         ttk.Radiobutton(
-            sec2, text="Ya en servidor:", variable=self._v_r_fs_src, value="server",
+            pi, text="Ya en servidor:", variable=self._v_r_fs_src, value="server",
             command=self._toggle_fs_src,
         ).grid(row=6, column=0, sticky="w", pady=(2, 0))
-        self._r_fs_srv_entry = ttk.Entry(sec2, textvariable=self._v_r_fs_srv, width=38, state="disabled")
+        self._r_fs_srv_entry = ttk.Entry(pi, textvariable=self._v_r_fs_srv, width=38, state="disabled")
         self._r_fs_srv_entry.grid(row=6, column=1, sticky="ew", padx=(4, 4))
 
         ttk.Radiobutton(
-            sec2, text="No restaurar filestore", variable=self._v_r_fs_src, value="none",
+            pi, text="No restaurar filestore", variable=self._v_r_fs_src, value="none",
             command=self._toggle_fs_src,
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        ttk.Separator(sec2, orient="horizontal").grid(
+        ttk.Separator(pi, orient="horizontal").grid(
             row=8, column=0, columnspan=3, sticky="ew", pady=_PAD
         )
 
         # Inventory file (optional) — companion JSON generated at backup time.
         # When provided, post-restore checks compare against the backup baseline.
         ttk.Label(
-            sec2, text="Inventario backup:",
+            pi, text="Inventario backup:",
             foreground=_C_PURPLE, font=("Segoe UI", 9, "bold"),
         ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
-        self._r_inv_entry = ttk.Entry(sec2, textvariable=self._v_r_inventory)
+        self._r_inv_entry = ttk.Entry(pi, textvariable=self._v_r_inventory)
         self._r_inv_entry.grid(row=10, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=2)
 
-        inv_btn_frame = ttk.Frame(sec2)
+        inv_btn_frame = ttk.Frame(pi)
         inv_btn_frame.grid(row=10, column=2, sticky="w")
         ttk.Button(
             inv_btn_frame, text="...", width=3,
@@ -2812,13 +3590,17 @@ class BackupApp:
         ).pack(side="left")
 
         self._lbl_inv_status = ttk.Label(
-            sec2, text="  Opcional — mejora la precision de las verificaciones",
+            pi, text="  Opcional — mejora la precision de las verificaciones",
             foreground="gray", font=("Segoe UI", 8),
         )
         self._lbl_inv_status.grid(row=11, column=0, columnspan=3, sticky="w")
 
         # Auto-detect inventory when dump path changes
         self._v_r_dump_local.trace_add("write", lambda *_: self._auto_detect_inventory(silent=True))
+
+        # Grid the individual panel into sec2 and apply initial visibility
+        self._pnl_individual.grid(row=5, column=0, columnspan=3, sticky="ew")
+        self._toggle_restore_mode()
 
         # ── Sección 3: Base de datos destino ─────────────────────────────
         sec3 = ttk.LabelFrame(f, text="3. Base de datos destino", padding=_PAD)
@@ -3108,6 +3890,21 @@ class BackupApp:
             )
         return self._ssh_dest
 
+    def _toggle_restore_mode(self) -> None:
+        """Show/hide the bundle vs individual-file panels in Tab 6 Sec 2."""
+        mode = self._v_r_restore_mode.get()
+        if mode == "bundle":
+            self._pnl_bundle.grid()
+            self._pnl_individual.grid_remove()
+        else:
+            self._pnl_bundle.grid_remove()
+            self._pnl_individual.grid()
+
+    def _toggle_bundle_src(self) -> None:
+        local = self._v_r_bundle_src.get() == "local"
+        self._r_bundle_local_entry.config(state="normal" if local else "disabled")
+        self._r_bundle_srv_entry.config(state="disabled" if local else "normal")
+
     def _toggle_dump_src(self) -> None:
         local = self._v_r_dump_src.get() == "local"
         self._r_dump_local_entry.config(state="normal" if local else "disabled")
@@ -3208,19 +4005,23 @@ class BackupApp:
             jobs = 4
 
         params = {
-            "db_name":    self._v_r_db_name.get().strip(),
-            "dump_src":   self._v_r_dump_src.get(),
-            "dump_local": self._v_r_dump_local.get(),
-            "dump_srv":   self._v_r_dump_srv.get(),
-            "fs_src":     self._v_r_fs_src.get(),
-            "fs_local":   self._v_r_fs_local.get(),
-            "fs_srv":     self._v_r_fs_srv.get(),
-            "fs_root":    self._v_r_fs_root.get(),
-            "jobs":       jobs,
-            "neutralize": self._v_r_neutralize.get(),
-            "odoo_conf":  self._v_r_conf.get(),
-            "cleanup":    self._v_r_cleanup.get(),
-            "inventory":  self._v_r_inventory.get().strip(),
+            "db_name":      self._v_r_db_name.get().strip(),
+            "restore_mode": self._v_r_restore_mode.get(),
+            "bundle_src":   self._v_r_bundle_src.get(),
+            "bundle_local": self._v_r_bundle_local.get().strip(),
+            "bundle_srv":   self._v_r_bundle_srv.get().strip(),
+            "dump_src":     self._v_r_dump_src.get(),
+            "dump_local":   self._v_r_dump_local.get(),
+            "dump_srv":     self._v_r_dump_srv.get(),
+            "fs_src":       self._v_r_fs_src.get(),
+            "fs_local":     self._v_r_fs_local.get(),
+            "fs_srv":       self._v_r_fs_srv.get(),
+            "fs_root":      self._v_r_fs_root.get(),
+            "jobs":         jobs,
+            "neutralize":   self._v_r_neutralize.get(),
+            "odoo_conf":    self._v_r_conf.get(),
+            "cleanup":      self._v_r_cleanup.get(),
+            "inventory":    self._v_r_inventory.get().strip(),
         }
 
         threading.Thread(
@@ -3234,6 +4035,71 @@ class BackupApp:
         mgr = RestoreManager(ssh)
         db = p["db_name"]
         uploaded: list[str] = []   # remote paths to clean up on finish
+        _bundle_extract_dir: str = ""  # set when bundle is extracted; cleaned up at end
+
+        # ── Bundle extraction (if mode == "bundle") ───────────────────────
+        if p.get("restore_mode") == "bundle":
+            try:
+                import uuid as _uuid
+                bm = BundleManager(ssh)
+                extract_dir = f"/tmp/obt_restore_{_uuid.uuid4().hex[:8]}"
+                _bundle_extract_dir = extract_dir
+
+                bundle_src = p.get("bundle_src", "local")
+                if bundle_src == "local":
+                    # Upload the local bundle to the server first
+                    bundle_local = p.get("bundle_local", "")
+                    if not bundle_local or not os.path.isfile(bundle_local):
+                        self._q.put(("error", f"Bundle no encontrado: {bundle_local}"))
+                        self._q.put(("btn_r_enable", None))
+                        return
+                    bundle_fname  = os.path.basename(bundle_local)
+                    bundle_remote = f"/tmp/{bundle_fname}"
+                    self._log(f"Subiendo bundle al servidor: {bundle_fname}")
+                    mgr.upload_file(bundle_local, bundle_remote, log_callback=self._log)
+                    uploaded.append(bundle_remote)
+                else:
+                    bundle_remote = p.get("bundle_srv", "")
+                    if not bundle_remote:
+                        self._q.put(("error", "Ruta del bundle en servidor no especificada."))
+                        self._q.put(("btn_r_enable", None))
+                        return
+
+                extracted = bm.extract_on_server(bundle_remote, extract_dir, log_callback=self._log)
+
+                # Override params with extracted paths
+                if extracted.get("dump"):
+                    p["dump_src"] = "server"
+                    p["dump_srv"] = extracted["dump"]
+                else:
+                    self._q.put(("error", "El bundle no contiene un archivo de dump reconocible."))
+                    self._q.put(("btn_r_enable", None))
+                    bm.cleanup_extract_dir(extract_dir)
+                    return
+
+                if extracted.get("filestore"):
+                    p["fs_src"] = "server"
+                    p["fs_srv"] = extracted["filestore"]
+                else:
+                    p["fs_src"] = "none"
+
+                if extracted.get("inventory") and not p.get("inventory"):
+                    inv_dict = bm.read_inventory_from_server(extracted["inventory"])
+                    if inv_dict:
+                        # Save locally so InventoryManager.load() can read it
+                        import tempfile as _tempfile
+                        inv_tmp = _tempfile.NamedTemporaryFile(
+                            suffix="_inventory.json", delete=False, mode="w", encoding="utf-8"
+                        )
+                        import json as _json
+                        _json.dump(inv_dict, inv_tmp, ensure_ascii=False, indent=2)
+                        inv_tmp.close()
+                        p["inventory"] = inv_tmp.name
+
+            except Exception as exc_bundle:
+                self._q.put(("error", f"Error procesando bundle: {exc_bundle}"))
+                self._q.put(("btn_r_enable", None))
+                return
 
         # Load backup inventory if provided (optional — enriches post-restore checks)
         inventory: dict | None = None
@@ -3401,6 +4267,14 @@ class BackupApp:
                 pass
             self._q.put(("error", f"Restauracion fallida:\n{exc}"))
             self._q.put(("btn_r_enable", None))
+        finally:
+            # Clean up bundle extraction directory if one was created
+            if _bundle_extract_dir:
+                try:
+                    BundleManager(ssh).cleanup_extract_dir(_bundle_extract_dir)
+                    self._log(f"Directorio de extraccion eliminado: {_bundle_extract_dir}")
+                except Exception:
+                    pass
 
     # ── Tab 7: Addons Sync ───────────────────────────────────────────────
 
@@ -4735,4 +5609,239 @@ class BackupApp:
         self._ssh.close()
         self._ssh_restore.close()
         self._ssh_dest.close()
+        # Stop the background scheduler daemon before destroying the window
+        try:
+            self._scheduler.stop()
+        except Exception:
+            pass
         self.root.destroy()
+
+    # ── Tab 11: Automatización ────────────────────────────────────────────
+
+    def _tab_automation(self) -> None:
+        """
+        Tab Automatizacion: manage scheduled backup rules and monitor the
+        background scheduler. Reuses ProfileManager + ScheduleManager.
+        """
+        outer = ttk.Frame(self.nb)
+        self.nb.add(outer, text="  Automatizacion  ")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        _C_AMBER = "#FFF3CD"
+        _C_AMBER_FG = "#664D03"
+
+        # ── Status bar ────────────────────────────────────────────────────
+        status_bar = ttk.Frame(outer)
+        status_bar.grid(row=0, column=0, sticky="ew", padx=_PAD, pady=(_PAD, 4))
+        status_bar.columnconfigure(1, weight=1)
+
+        self._lbl_sched_status = ttk.Label(
+            status_bar,
+            text="● Programador activo",
+            foreground="#2E8B57",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self._lbl_sched_status.grid(row=0, column=0, sticky="w")
+
+        btn_toggle = ttk.Button(
+            status_bar,
+            text="⏸ Pausar",
+            command=self._sched_toggle_pause,
+        )
+        btn_toggle.grid(row=0, column=2, padx=(0, 4))
+        self._btn_sched_toggle = btn_toggle
+
+        # ── Rule list (Treeview) ─────────────────────────────────────────
+        lf_rules = ttk.LabelFrame(outer, text="Reglas de backup programado", padding=_PAD)
+        lf_rules.grid(row=1, column=0, sticky="nsew", padx=_PAD, pady=(0, 4))
+        lf_rules.columnconfigure(0, weight=1)
+        lf_rules.rowconfigure(0, weight=1)
+
+        cols = ("#", "Habilitado", "Cliente", "BD", "Destino", "Hora", "Proximo", "Ultimo resultado")
+        self._sched_tree = ttk.Treeview(
+            lf_rules,
+            columns=cols,
+            show="headings",
+            height=8,
+            selectmode="browse",
+        )
+        col_widths = [30, 80, 140, 140, 90, 70, 120, 200]
+        for col, w in zip(cols, col_widths):
+            self._sched_tree.heading(col, text=col)
+            self._sched_tree.column(col, width=w, anchor="center" if col in ("#", "Habilitado", "Hora", "Proximo") else "w")
+
+        self._sched_tree.grid(row=0, column=0, sticky="nsew")
+
+        vsb = ttk.Scrollbar(lf_rules, orient="vertical", command=self._sched_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._sched_tree.configure(yscrollcommand=vsb.set)
+
+        # Tag colors for last result column
+        self._sched_tree.tag_configure("ok",    foreground="#2E8B57")
+        self._sched_tree.tag_configure("error", foreground="#C0392B")
+        self._sched_tree.tag_configure("none",  foreground="#888888")
+
+        # ── Action buttons ────────────────────────────────────────────────
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=2, column=0, sticky="ew", padx=_PAD, pady=4)
+
+        ttk.Button(
+            btn_row, text="+ Agregar",
+            style="Primary.TButton",
+            command=self._sched_add,
+        ).pack(side="left", padx=(0, 4))
+
+        ttk.Button(
+            btn_row, text="Editar",
+            command=self._sched_edit,
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            btn_row, text="Eliminar",
+            style="Stop.TButton",
+            command=self._sched_delete,
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            btn_row, text="▶ Ejecutar ahora",
+            command=self._sched_run_now,
+        ).pack(side="left", padx=4)
+
+        # Populate tree on first display
+        self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_refresh_tree(self, rules: list) -> None:
+        """Rebuild the automation Treeview from the given rule list."""
+        try:
+            tree = self._sched_tree
+        except AttributeError:
+            return
+        # Guard: tree.delete() with no args raises TclError ("root item may not be deleted")
+        children = tree.get_children()
+        if children:
+            tree.delete(*children)
+        for i, r in enumerate(rules, 1):
+            label      = r.get("label") or r.get("db_name", "—")
+            db_name    = r.get("db_name", "")
+            dest_type  = r.get("dest_type", "gdrive")
+            hour       = r.get("schedule_hour", 2)
+            minute     = r.get("schedule_minute", 0)
+            enabled    = "Si" if r.get("enabled") else "No"
+            last_res   = r.get("last_result") or "—"
+            last_msg   = r.get("last_message", "")
+            last_run   = r.get("last_run_ts", "")
+            last_run_d = last_run[:10] if last_run else "Nunca"
+
+            # Next run estimate
+            from datetime import datetime as _dt
+            try:
+                now = _dt.now()
+                due = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+                if now >= due:
+                    from datetime import timedelta
+                    due = due + timedelta(days=1)
+                next_str = due.strftime("%m/%d %H:%M")
+            except Exception:
+                next_str = f"{hour:02d}:{minute:02d}"
+
+            result_display = last_res if last_res == "—" else last_res
+            if last_msg and last_res != "—":
+                result_display = f"{last_res} — {last_msg[:60]}"
+
+            tag = "ok" if last_res == "ok" else ("error" if last_res == "error" else "none")
+            tree.insert(
+                "", "end",
+                iid=r["id"],
+                values=(i, enabled, label, db_name, dest_type,
+                        f"{int(hour):02d}:{int(minute):02d}",
+                        next_str, result_display),
+                tags=(tag,),
+            )
+
+    def _sched_toggle_pause(self) -> None:
+        """Toggle the scheduler between paused and active states."""
+        if self._scheduler.is_paused:
+            self._scheduler.resume()
+            self._lbl_sched_status.config(
+                text="● Programador activo", foreground="#2E8B57"
+            )
+            self._btn_sched_toggle.config(text="⏸ Pausar")
+        else:
+            self._scheduler.pause()
+            self._lbl_sched_status.config(
+                text="⏸ Programador pausado", foreground="#888888"
+            )
+            self._btn_sched_toggle.config(text="▶ Reanudar")
+
+    def _sched_selected_id(self) -> str | None:
+        """Return the rule ID of the currently selected Treeview row, or None."""
+        sel = self._sched_tree.selection()
+        return sel[0] if sel else None
+
+    def _sched_add(self) -> None:
+        """Open the schedule dialog to create a new rule."""
+        dlg = _ScheduleDialog(self.root, self._profiles, None)
+        result = dlg.show()
+        if result:
+            # Set last_run_ts to today so the rule does not fire immediately after
+            # creation; it will first execute at the next scheduled time (tomorrow
+            # at the earliest). The user can trigger an on-demand run via
+            # "Ejecutar ahora" if needed.
+            result["last_run_ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+            self._sched_mgr.add(result)
+            self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_edit(self) -> None:
+        """Open the schedule dialog pre-filled with the selected rule."""
+        rule_id = self._sched_selected_id()
+        if not rule_id:
+            messagebox.showwarning(APP_TITLE, "Seleccione una regla para editar.")
+            return
+        rule = self._sched_mgr.get(rule_id)
+        if not rule:
+            return
+        dlg = _ScheduleDialog(self.root, self._profiles, rule)
+        result = dlg.show()
+        if result:
+            self._sched_mgr.update(rule_id, result)
+            self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_delete(self) -> None:
+        """Delete the selected rule after confirmation."""
+        rule_id = self._sched_selected_id()
+        if not rule_id:
+            messagebox.showwarning(APP_TITLE, "Seleccione una regla para eliminar.")
+            return
+        rule = self._sched_mgr.get(rule_id)
+        label = rule.get("label") if rule else rule_id
+        if not messagebox.askyesno(APP_TITLE, f'¿Eliminar la regla "{label}"?'):
+            return
+        self._sched_mgr.delete(rule_id)
+        self._sched_refresh_tree(self._sched_mgr.list_rules())
+
+    def _sched_run_now(self) -> None:
+        """Force-run the selected rule immediately (ignores schedule time)."""
+        rule_id = self._sched_selected_id()
+        if not rule_id:
+            messagebox.showwarning(APP_TITLE, "Seleccione una regla para ejecutar.")
+            return
+        rule = self._sched_mgr.get(rule_id)
+        if not rule:
+            return
+        label = rule.get("label") or rule.get("db_name", rule_id[:8])
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f'¿Ejecutar ahora el backup "{label}"?\n\n'
+            "Se ejecutara en segundo plano. El resultado aparecera en el log.",
+        ):
+            return
+        # Run in a fresh thread via the scheduler's _run_rule logic
+        t = threading.Thread(
+            target=self._scheduler._run_rule,
+            args=(rule,),
+            name=f"sched-manual-{rule_id[:8]}",
+            daemon=True,
+        )
+        t.start()
+        self._sched_append_log(f"[{label}] Ejecucion manual iniciada...")
