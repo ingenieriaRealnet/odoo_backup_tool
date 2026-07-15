@@ -156,6 +156,11 @@ _KW_LOG_RE = re.compile(
 APP_TITLE = "Odoo Backup Tool"
 _PAD = 8
 
+# Sentinel value shown as the first option in every profile combobox.
+# Selecting it is equivalent to "no profile selected" — triggers the
+# create-new-profile path when the user clicks Guardar.
+_PROFILE_NEW = "— Nuevo perfil —"
+
 # Persistent settings file (geometry, sash position)
 _SETTINGS_FILE = os.path.join(
     os.path.expanduser("~"), ".odoo_backup_tool", "settings.json"
@@ -1470,8 +1475,9 @@ class BackupApp:
 
         self._cb_profile = ttk.Combobox(
             pnl_prof, state="readonly",
-            values=self._profiles.names(),
+            values=[_PROFILE_NEW] + self._profiles.names(),
         )
+        self._cb_profile.set(_PROFILE_NEW)
         self._cb_profile.grid(row=0, column=0, padx=(0, _PAD), pady=2, sticky="ew")
         self._cb_profile.bind("<<ComboboxSelected>>", lambda e: self._load_profile())
 
@@ -1575,8 +1581,9 @@ class BackupApp:
 
         self._cb_r_profile = ttk.Combobox(
             pnl_b_prof, state="readonly",
-            values=self._profiles.names(),
+            values=[_PROFILE_NEW] + self._profiles.names(),
         )
+        self._cb_r_profile.set(_PROFILE_NEW)
         self._cb_r_profile.grid(row=0, column=0, padx=(0, _PAD), pady=2, sticky="ew")
         self._cb_r_profile.bind("<<ComboboxSelected>>", lambda e: self._load_r_profile())
 
@@ -1772,8 +1779,9 @@ class BackupApp:
 
         self._cb_d_profile = ttk.Combobox(
             pnl_d_prof, state="readonly",
-            values=self._profiles.names(),
+            values=[_PROFILE_NEW] + self._profiles.names(),
         )
+        self._cb_d_profile.set(_PROFILE_NEW)
         self._cb_d_profile.grid(row=0, column=0, padx=(0, _PAD), pady=2, sticky="ew")
         self._cb_d_profile.bind("<<ComboboxSelected>>", lambda e: self._load_d_profile())
 
@@ -2121,15 +2129,16 @@ class BackupApp:
 
     def _refresh_profile_combos(self) -> None:
         """Sync all profile comboboxes with the current profile list."""
-        names = self._profiles.names()
-        self._cb_profile["values"]   = names
-        self._cb_d_profile["values"] = names
-        self._cb_r_profile["values"] = names
+        names  = self._profiles.names()
+        values = [_PROFILE_NEW] + names
+        self._cb_profile["values"]   = values
+        self._cb_d_profile["values"] = values
+        self._cb_r_profile["values"] = values
 
     def _load_profile(self) -> None:
         """Fill Tab-1 connection fields from the selected profile."""
         name = self._cb_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             return
         p = self._profiles.get(name)
         if p:
@@ -2151,6 +2160,8 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
         existing = self._cb_profile.get()
+        if existing == _PROFILE_NEW:
+            existing = ""
         if existing:
             # Editing an existing profile — confirm and overwrite directly
             if not messagebox.askyesno(
@@ -2186,19 +2197,19 @@ class BackupApp:
     def _delete_profile(self) -> None:
         """Delete the selected profile from the backup profile combobox."""
         name = self._cb_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             messagebox.showwarning(APP_TITLE, "Seleccione un perfil para eliminar.")
             return
         if not messagebox.askyesno(APP_TITLE, f'¿Eliminar el perfil "{name}"?'):
             return
         self._profiles.delete(name)
         self._refresh_profile_combos()
-        self._cb_profile.set("")
+        self._cb_profile.set(_PROFILE_NEW)
 
     def _load_d_profile(self) -> None:
         """Fill Tab-4 destination server fields from the selected profile."""
         name = self._cb_d_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             return
         p = self._profiles.get(name)
         if p:
@@ -2218,6 +2229,8 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
         existing = self._cb_d_profile.get()
+        if existing == _PROFILE_NEW:
+            existing = ""
         if existing:
             if not messagebox.askyesno(
                 APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
@@ -2249,19 +2262,19 @@ class BackupApp:
     def _delete_d_profile(self) -> None:
         """Delete the selected profile from the destination profile combobox."""
         name = self._cb_d_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             messagebox.showwarning(APP_TITLE, "Seleccione un perfil para eliminar.")
             return
         if not messagebox.askyesno(APP_TITLE, f'¿Eliminar el perfil "{name}"?'):
             return
         self._profiles.delete(name)
         self._refresh_profile_combos()
-        self._cb_d_profile.set("")
+        self._cb_d_profile.set(_PROFILE_NEW)
 
     def _load_r_profile(self) -> None:
         """Fill Servidor B connection fields from the selected profile."""
         name = self._cb_r_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             return
         p = self._profiles.get(name)
         if p:
@@ -2280,6 +2293,8 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
         existing = self._cb_r_profile.get()
+        if existing == _PROFILE_NEW:
+            existing = ""
         if existing:
             if not messagebox.askyesno(
                 APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
@@ -2314,14 +2329,14 @@ class BackupApp:
     def _delete_r_profile(self) -> None:
         """Delete the selected profile from the restore profile combobox."""
         name = self._cb_r_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             messagebox.showwarning(APP_TITLE, "Seleccione un perfil para eliminar.")
             return
         if not messagebox.askyesno(APP_TITLE, f'¿Eliminar el perfil "{name}"?'):
             return
         self._profiles.delete(name)
         self._refresh_profile_combos()
-        self._cb_r_profile.set("")
+        self._cb_r_profile.set(_PROFILE_NEW)
 
     # ── Pre-flight validation helpers ────────────────────────────────────
 
