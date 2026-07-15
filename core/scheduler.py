@@ -23,6 +23,7 @@ import os
 import queue
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -221,6 +222,12 @@ class BackupScheduler:
         self._active_jobs: dict[str, threading.Thread] = {}
         self._jobs_lock = threading.Lock()
 
+        # Cache of DriveUploader instances keyed by (creds_path, folder_id).
+        # Reusing instances avoids rebuilding the OAuth service and re-resolving
+        # the target folder on every scheduled rule execution.
+        self._drive_cache:      dict[tuple, object] = {}
+        self._drive_cache_lock: threading.Lock      = threading.Lock()
+
         self._thread = threading.Thread(
             target=self._loop,
             name="backup-scheduler",
@@ -332,6 +339,20 @@ class BackupScheduler:
         except Exception:  # noqa: BLE001
             pass
 
+    def _get_uploader(self, creds_path: str, folder_id: str):
+        """
+        Return a cached DriveUploader for (creds_path, folder_id).
+
+        Reusing the same instance avoids rebuilding the OAuth service connection
+        and re-resolving the Drive folder on every rule execution.
+        """
+        from .gdrive import DriveUploader
+        key = (creds_path, folder_id)
+        with self._drive_cache_lock:
+            if key not in self._drive_cache:
+                self._drive_cache[key] = DriveUploader(creds_path, folder_id)
+            return self._drive_cache[key]
+
     def _run_rule(self, rule: dict) -> None:
         """
         Execute one backup job headlessly, reusing the same core classes
@@ -341,11 +362,10 @@ class BackupScheduler:
           Phase A: create dump + filestore zip on source server (non-retryable)
           Phase B: transfer to destination (retryable in manual mode; not here)
         """
-        from .ssh_client          import SSHClient
-        from .db_manager          import DBManager
-        from .filestore_manager   import FilestoreManager
-        from .transfer            import TransferManager
-        from .gdrive              import DriveUploader
+        from .ssh_client        import SSHClient
+        from .db_manager        import DBManager
+        from .filestore_manager import FilestoreManager
+        from .transfer          import TransferManager
 
         rule_id = rule["id"]
         label   = rule.get("label") or rule.get("db_name", rule_id[:8])
@@ -459,25 +479,55 @@ class BackupScheduler:
             # ── Phase B: transfer to destination ─────────────────────────────
             dest_type = rule.get("dest_type", "gdrive")
 
-            for remote_path in remote_tmp:
-                filename = os.path.basename(remote_path)
+            # Resolve Drive credentials once — used both by the upload helper
+            # and by the post-upload retention cleanup.
+            creds_path = (
+                rule.get("dest_gdrive_creds")
+                or profile.get("gdrive_creds_path", "")
+            )
+            folder_id = (
+                rule.get("dest_gdrive_folder_id")
+                or profile.get("gdrive_folder_id", "")
+            )
 
-                if dest_type == "local":
-                    local_dir = rule.get("dest_local_dir", "")
-                    if not local_dir:
-                        raise RuntimeError("Directorio local de destino no configurado.")
-                    os.makedirs(local_dir, exist_ok=True)
+            def _upload_one_to_drive(remote_path: str) -> None:
+                """Upload a single remote file to Drive via streaming SFTP."""
+                filename   = os.path.basename(remote_path)
+                uploader   = self._get_uploader(creds_path, folder_id)
+                total_size = tm.get_remote_file_size(remote_path)
+                sftp_sess, sftp_file = tm.open_remote_file(remote_path)
+                try:
+                    log(f"[{label}] Enviando a Drive (streaming): {filename}")
+                    uploader.upload_stream(
+                        sftp_file,
+                        filename,
+                        total_size=total_size,
+                        log_callback=log,
+                    )
+                finally:
+                    sftp_file.close()
+                    sftp_sess.close()
+
+            if dest_type == "local":
+                local_dir = rule.get("dest_local_dir", "")
+                if not local_dir:
+                    raise RuntimeError("Directorio local de destino no configurado.")
+                os.makedirs(local_dir, exist_ok=True)
+                for remote_path in remote_tmp:
+                    filename = os.path.basename(remote_path)
                     log(f"[{label}] Descargando {filename} -> {local_dir}")
                     tm.download_to_local(remote_path, local_dir, log_callback=log)
 
-                elif dest_type == "remote":
-                    dest_profile_name = rule.get("dest_remote_profile", "")
-                    dest_prof = self._profiles.get(dest_profile_name) if dest_profile_name else None
-                    if not dest_prof:
-                        raise RuntimeError(
-                            f"Perfil de servidor destino '{dest_profile_name}' no encontrado."
-                        )
-                    dest_dir = rule.get("dest_remote_dir", "/tmp")
+            elif dest_type == "remote":
+                dest_profile_name = rule.get("dest_remote_profile", "")
+                dest_prof = self._profiles.get(dest_profile_name) if dest_profile_name else None
+                if not dest_prof:
+                    raise RuntimeError(
+                        f"Perfil de servidor destino '{dest_profile_name}' no encontrado."
+                    )
+                dest_dir = rule.get("dest_remote_dir", "/tmp")
+                for remote_path in remote_tmp:
+                    filename = os.path.basename(remote_path)
                     log(f"[{label}] Transfiriendo {filename} -> {dest_prof['host']}:{dest_dir}")
                     tm.transfer_to_server(
                         remote_path,
@@ -489,46 +539,39 @@ class BackupScheduler:
                         log_callback=log,
                     )
 
+            else:
+                # Default: Google Drive streaming
+                if not creds_path or not folder_id:
+                    raise RuntimeError(
+                        "Credenciales o carpeta de Google Drive no configuradas."
+                    )
+
+                if len(remote_tmp) > 1:
+                    # Multiple files (bundle failed — individual dump + filestore).
+                    # Upload them in parallel to cut total time roughly in half.
+                    log(f"[{label}] Subiendo {len(remote_tmp)} archivos a Drive en paralelo ...")
+                    with ThreadPoolExecutor(
+                        max_workers=len(remote_tmp),
+                        thread_name_prefix=f"drive-upload-{rule_id[:6]}",
+                    ) as pool:
+                        futures = {
+                            pool.submit(_upload_one_to_drive, rp): rp
+                            for rp in remote_tmp
+                        }
+                        for fut in as_completed(futures):
+                            fut.result()  # re-raises any upload exception
                 else:
-                    # Default: Google Drive streaming
-                    creds_path = (
-                        rule.get("dest_gdrive_creds")
-                        or profile.get("gdrive_creds_path", "")
-                    )
-                    folder_id = (
-                        rule.get("dest_gdrive_folder_id")
-                        or profile.get("gdrive_folder_id", "")
-                    )
-                    if not creds_path or not folder_id:
-                        raise RuntimeError(
-                            "Credenciales o carpeta de Google Drive no configuradas."
-                        )
+                    _upload_one_to_drive(remote_tmp[0])
 
-                    uploader = DriveUploader(creds_path, folder_id)
-                    total_size = tm.get_remote_file_size(remote_path)
-                    sftp_sess, sftp_file = tm.open_remote_file(remote_path)
-                    try:
-                        log(f"[{label}] Enviando a Drive (streaming): {filename}")
-                        uploader.upload_stream(
-                            sftp_file,
-                            filename,
-                            total_size=total_size,
-                            log_callback=log,
-                        )
-                    finally:
-                        sftp_file.close()
-                        sftp_sess.close()
-
-                    # Retention cleanup — match bundles by db_name prefix
-                    retention = int(rule.get("retention_days", 90))
-                    if retention > 0:
-                        # Bundle names: "{db_name}_{ts}_obt.tar"
-                        prefix = f"{db_name}_"
-                        deleted = uploader.cleanup_old_files(
-                            prefix, retention, log_callback=log
-                        )
-                        if deleted:
-                            log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
+                # Retention cleanup — applied once per rule after all uploads succeed.
+                # Bundle naming: "{db_name}_{ts}_obt.tar" → prefix "{db_name}_"
+                retention = int(rule.get("retention_days", 90))
+                if retention > 0:
+                    uploader = self._get_uploader(creds_path, folder_id)
+                    prefix   = f"{db_name}_"
+                    deleted  = uploader.cleanup_old_files(prefix, retention, log_callback=log)
+                    if deleted:
+                        log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
 
             # ── Cleanup server tmp files ──────────────────────────────────────
             if rule.get("cleanup_server"):

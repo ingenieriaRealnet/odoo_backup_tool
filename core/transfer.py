@@ -76,7 +76,8 @@ class TransferManager:
         """
         sftp = self._ssh.open_sftp()
         sftp_file = sftp.open(remote_path, "rb")
-        sftp_file.prefetch()  # pipeline read-ahead for better throughput
+        # 64 MB read-ahead — reduces SSH round-trips on high-latency connections.
+        sftp_file.prefetch(size=64 * 1024 * 1024)
         return sftp, sftp_file
 
     def download_to_local(
@@ -140,11 +141,16 @@ class TransferManager:
         log_callback: Callable[[str], None] | None = None,
     ) -> None:
         """
-        Push a file from the source server to another server using scp.
+        Push a file from the source server to another server.
 
-        sshpass is used on the source server to provide the password
-        non-interactively. If sshpass is not installed, the method
-        attempts to install it automatically.
+        Uses rsync when available (preferred): supports partial-file resume
+        (--partial) so an interrupted transfer can continue from where it left
+        off instead of restarting from byte 0.  Falls back to scp transparently
+        if rsync is not installed on the source server.
+
+        Security: the password is passed via the SSHPASS environment variable
+        (sshpass -e) rather than as a command-line argument (-p), so it does
+        not appear in `ps aux` output on the source server.
 
         Args:
             remote_path: File path on the source server.
@@ -153,17 +159,19 @@ class TransferManager:
             dest_user: Destination SSH username.
             dest_pass: Destination SSH password.
             dest_dir: Directory on the destination server.
+            dest_filename: Override the saved filename (for rename on conflict).
             log_callback: Called with status messages.
 
         Raises:
-            RuntimeError: If the scp command fails.
+            RuntimeError: If the transfer command fails.
         """
-        filename = os.path.basename(remote_path)
+        filename  = os.path.basename(remote_path)
+        dest_name = dest_filename or filename
 
         if log_callback:
             log_callback(f"Transfiriendo {filename} -> {dest_host}:{dest_dir} ...")
 
-        # Ensure sshpass is available on the source server
+        # ── 1. Ensure sshpass is available ────────────────────────────────
         code, _, _ = self._ssh.execute("which sshpass")
         if code != 0:
             self._ssh.execute(
@@ -171,13 +179,13 @@ class TransferManager:
                 "yum install -y sshpass 2>/dev/null"
             )
 
-        # ── 1. Create destination directory ───────────────────────────────
-        # scp cannot create missing parent directories and will fail with
-        # "dest open: Failure" if the path does not exist.
+        # Common SSH options reused by both rsync and scp
+        ssh_opts = f"-F /dev/null -p {dest_port} -o StrictHostKeyChecking=no"
+
+        # ── 2. Create destination directory ───────────────────────────────
         mkdir_cmd = (
-            f"sshpass -p '{dest_pass}' ssh -F /dev/null -p {dest_port} "
-            f"-o StrictHostKeyChecking=no "
-            f"{dest_user}@{dest_host} 'mkdir -p {dest_dir}'"
+            f"SSHPASS='{dest_pass}' sshpass -e "
+            f"ssh {ssh_opts} {dest_user}@{dest_host} 'mkdir -p {dest_dir}'"
         )
         code, _, err = self._ssh.execute(mkdir_cmd, timeout=30)
         if code != 0:
@@ -185,12 +193,11 @@ class TransferManager:
                 f"No se pudo crear el directorio {dest_dir} en {dest_host}:\n{err}"
             )
 
-        # ── 2. Verify write permission ─────────────────────────────────────
-        # The directory may exist but belong to a different user/group.
+        # ── 3. Verify write permission ─────────────────────────────────────
         perm_cmd = (
-            f"sshpass -p '{dest_pass}' ssh -F /dev/null -p {dest_port} "
-            f"-o StrictHostKeyChecking=no "
-            f"{dest_user}@{dest_host} 'test -w {dest_dir} && echo writable'"
+            f"SSHPASS='{dest_pass}' sshpass -e "
+            f"ssh {ssh_opts} {dest_user}@{dest_host} "
+            f"'test -w {dest_dir} && echo writable'"
         )
         code, perm_out, _ = self._ssh.execute(perm_cmd, timeout=15)
         if code != 0 or "writable" not in perm_out:
@@ -204,30 +211,24 @@ class TransferManager:
                 f"'chown {dest_user} {dest_dir}' en el servidor destino."
             )
 
-        # ── 3. Check available disk space ─────────────────────────────────
-        # Get source file size, then compare against free space on destination.
-        # Prevents the cryptic "scp: write ... Failure" caused by a full disk.
+        # ── 4. Check available disk space ─────────────────────────────────
         file_size = self.get_remote_file_size(remote_path)
         if file_size > 0:
-            # df -B1 gives bytes; tail -1 skips the header; tr+cut extract column 4 (Avail)
             space_cmd = (
-                f"sshpass -p '{dest_pass}' ssh -F /dev/null -p {dest_port} "
-                f"-o StrictHostKeyChecking=no "
-                f"{dest_user}@{dest_host} "
+                f"SSHPASS='{dest_pass}' sshpass -e "
+                f"ssh {ssh_opts} {dest_user}@{dest_host} "
                 f"'df -B1 {dest_dir} | tail -1 | tr -s \" \" | cut -d\" \" -f4'"
             )
             code, space_out, _ = self._ssh.execute(space_cmd, timeout=15)
             if code == 0 and space_out.strip().isdigit():
                 avail_bytes = int(space_out.strip())
-                need_mb  = file_size   / (1024 * 1024)
-                avail_mb = avail_bytes / (1024 * 1024)
-
+                need_mb     = file_size   / (1024 * 1024)
+                avail_mb    = avail_bytes / (1024 * 1024)
                 if log_callback:
                     log_callback(
                         f"Espacio en destino: {avail_mb:,.1f} MB disponibles | "
                         f"Archivo: {need_mb:,.1f} MB"
                     )
-
                 if avail_bytes < file_size:
                     raise RuntimeError(
                         f"Espacio insuficiente en {dest_host}:{dest_dir}\n\n"
@@ -237,28 +238,46 @@ class TransferManager:
                     )
             elif log_callback:
                 log_callback(
-                    f"[aviso] No se pudo verificar el espacio disponible en "
+                    f"[aviso] No se pudo verificar espacio disponible en "
                     f"{dest_host}:{dest_dir} — procediendo de todas formas."
                 )
+        elif log_callback:
+            log_callback(f"Directorio {dest_dir} verificado en {dest_host}.")
+
+        # ── 5. Transfer — rsync preferred, scp fallback ───────────────────
+        # rsync --partial keeps the incomplete file on the destination so a
+        # retry can resume from the last byte received, avoiding full re-sends.
+        # -a: archive mode (preserve timestamps/permissions).
+        # NOTE: SSHPASS env var keeps the password out of `ps aux` argv.
+        use_rsync = self._ssh.execute("which rsync")[0] == 0
+
+        if use_rsync:
+            if log_callback:
+                log_callback(f"  Usando rsync (modo: reanudable) ...")
+            transfer_cmd = (
+                f"SSHPASS='{dest_pass}' sshpass -e "
+                f"rsync -a --partial --timeout=300 "
+                f"-e 'ssh {ssh_opts}' "
+                f"{remote_path} {dest_user}@{dest_host}:{dest_dir}/{dest_name}"
+            )
         else:
             if log_callback:
-                log_callback(f"Directorio {dest_dir} verificado en {dest_host}.")
+                log_callback(f"  rsync no disponible — usando scp ...")
+            transfer_cmd = (
+                f"SSHPASS='{dest_pass}' sshpass -e "
+                f"scp {ssh_opts.replace('-p ', '-P ')} "
+                f"{remote_path} {dest_user}@{dest_host}:{dest_dir}/{dest_name}"
+            )
 
-        # ── 4. Transfer file via SCP ───────────────────────────────────────
-        # NOTE: the password is passed via sshpass, never echoed to the log.
-        dest_name = dest_filename or filename
-        scp_cmd = (
-            f"sshpass -p '{dest_pass}' scp -F /dev/null -P {dest_port} "
-            f"-o StrictHostKeyChecking=no "
-            f"{remote_path} {dest_user}@{dest_host}:{dest_dir}/{dest_name}"
-        )
-        code, _, err = self._ssh.execute(scp_cmd, timeout=3600)
+        code, _, err = self._ssh.execute(transfer_cmd, timeout=3600)
         if code != 0:
             raise RuntimeError(
                 f"Transferencia a {dest_host} fallo:\n{err}"
             )
 
         if log_callback:
+            method = "rsync" if use_rsync else "scp"
             log_callback(
-                f"Transferencia completa: {dest_user}@{dest_host}:{dest_dir}/{filename}"
+                f"Transferencia completa ({method}): "
+                f"{dest_user}@{dest_host}:{dest_dir}/{dest_name}"
             )
