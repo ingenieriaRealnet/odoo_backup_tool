@@ -372,6 +372,12 @@ class BackupScheduler:
         remote_tmp: list[str] = []
 
         def log(msg: str) -> None:
+            # Force [label] prefix on every line so concurrent client logs stay
+            # identifiable when multiple rules run simultaneously. Avoids doubling
+            # the prefix for outer calls that already include it explicitly.
+            stripped = msg.lstrip()
+            if not stripped.startswith(f"[{label}]"):
+                msg = f"[{label}] {stripped}"
             self._log(rule_id, msg)
 
         log(f"[{label}] Iniciando backup programado — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
