@@ -76,8 +76,10 @@ class TransferManager:
         """
         sftp = self._ssh.open_sftp()
         sftp_file = sftp.open(remote_path, "rb")
-        # 64 MB read-ahead — reduces SSH round-trips on high-latency connections.
-        sftp_file.prefetch(size=64 * 1024 * 1024)
+        # Enable read-ahead pipelining for better streaming throughput.
+        # Called without arguments for compatibility with all Paramiko versions
+        # (older builds don't accept the size kwarg).
+        sftp_file.prefetch()
         return sftp, sftp_file
 
     def download_to_local(
