@@ -493,7 +493,7 @@ class HelpWindow(tk.Toplevel):
         steps = [
             "Verificacion de espacio en /tmp del servidor.",
             "pg_dump ejecutado en el servidor → /tmp/{bd}.sql o /tmp/{bd}.dump",
-            "zip -1 -r del directorio filestore → /tmp/filestore_{bd}.zip",
+            "tar -cf del directorio filestore (sin compresion) → /tmp/filestore_{bd}.tar",
             "Transferencia de ambos archivos al destino (Tab 4).",
             "Inventario JSON generado y guardado junto al dump.",
             "Limpieza de /tmp en el servidor (archivos temporales eliminados).",
@@ -1093,7 +1093,7 @@ class HelpWindow(tk.Toplevel):
         self._h3("Fase 3 — Restauracion")
         steps = [
             "Tab 6: en 'Archivo dump' seleccionar el .dump descargado o la ruta en el servidor.",
-            "En 'Filestore ZIP' seleccionar el .zip.",
+            "En 'Filestore' seleccionar el .tar (o .zip en backups antiguos).",
             "Clic 'Auto' en Inventario — deberia detectarlo automaticamente.",
             "Ingresar nombre de la nueva BD: 'bancasa_test_YYYY_MM_DD'.",
             "Elegir 'Otro servidor' y conectarse al servidor de pruebas.",

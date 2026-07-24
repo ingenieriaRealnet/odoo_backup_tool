@@ -1,7 +1,7 @@
 """
 Bundle manager for Odoo Backup Tool.
 
-Wraps the three backup artifacts (.dump/.sql, filestore .zip, inventory .json)
+Wraps the three backup artifacts (.dump/.sql, filestore .tar/.zip, inventory .json)
 into a single uncompressed .tar archive on the remote server so they travel
 as one unit and remain associated.
 
@@ -114,7 +114,7 @@ class BundleManager:
         Returns a dict with detected artifact paths:
             {
               "dump":      "/tmp/.../odoo_bancasa_....dump"  or None,
-              "filestore": "/tmp/.../filestore_....zip"      or None,
+              "filestore": "/tmp/.../filestore_....tar"      or None,
               "inventory": "/tmp/.../..._inventory.json"     or None,
             }
 
@@ -144,7 +144,7 @@ class BundleManager:
             lower = name.lower()
             if lower.endswith(".dump") or lower.endswith(".sql"):
                 extracted["dump"] = path
-            elif lower.endswith(".zip"):
+            elif lower.endswith(".zip") or (lower.startswith("filestore_") and lower.endswith(".tar")):
                 extracted["filestore"] = path
             elif lower.endswith(".json"):
                 extracted["inventory"] = path
@@ -213,7 +213,7 @@ class BundleManager:
             lower = name.lower()
             if lower.endswith(".dump") or lower.endswith(".sql"):
                 extracted["dump"] = path
-            elif lower.endswith(".zip"):
+            elif lower.endswith(".zip") or (lower.startswith("filestore_") and lower.endswith(".tar")):
                 extracted["filestore"] = path
             elif lower.endswith(".json"):
                 extracted["inventory"] = path

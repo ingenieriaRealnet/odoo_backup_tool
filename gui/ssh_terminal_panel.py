@@ -277,15 +277,30 @@ class SshTerminalPanel(ttk.Frame):
         threading.Thread(target=_open, daemon=True).start()
 
     def disconnect(self) -> None:
-        """Cierra el canal PTY y detiene el hilo lector."""
+        """
+        Cierra el canal PTY y detiene el hilo lector.
+
+        channel.close() corre en un hilo daemon con espera acotada (5s):
+        puede quedar bloqueado esperando locks internos del transport si
+        el hilo lector todavia esta en medio de una lectura sobre un canal
+        colgado, y este metodo se llama de forma sincrona desde el cierre
+        de la app (Tk main thread) — igual que SSHClient.close().
+        """
         self._connected = False
         if self._channel:
-            try:
-                self._channel.close()
-            except Exception:
-                pass
+            channel = self._channel
             self._channel = None
+            t = threading.Thread(target=self._safe_close_channel, args=(channel,), daemon=True)
+            t.start()
+            t.join(timeout=5)
         self._append_local("\n[Sesion cerrada]\n", "info")
+
+    @staticmethod
+    def _safe_close_channel(channel) -> None:
+        try:
+            channel.close()
+        except Exception:
+            pass
 
     # ── Entrada ───────────────────────────────────────────────────────────────
 

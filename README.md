@@ -276,7 +276,7 @@ Al seleccionar un perfil en cualquier combobox de perfiles, los datos de conexi√
 - Servidor destino (A o B)
 - URL SSH del repositorio (ej: `git@github.com:mi-org/repo.git`)
 - Rama (branch, default: `main`)
-- Ruta de destino en el servidor (default: `/opt/odoo/addons_custom`)
+- Ruta de destino en el servidor (default: `/usr/lib/python3/dist-packages/odoo/addons_custom`)
 - Usuario Odoo del sistema operativo (default: `odoo`)
 - Tipo: repositorio normal o con subm√≥dulos (`git submodule update --remote --recursive`)
 

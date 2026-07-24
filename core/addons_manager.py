@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import io
 import os
+import shlex
 import socket
 from typing import Callable
 
@@ -40,8 +41,9 @@ from .ssh_client import SSHClient
 
 
 # Paths used on the DESTINATION server — always cleaned up after use
-_REMOTE_KEY_PATH    = "/tmp/.obt_gh_key"
-_REMOTE_SSH_WRAPPER = "/tmp/.obt_git_ssh.sh"
+_REMOTE_KEY_PATH     = "/tmp/.obt_gh_key"
+_REMOTE_SSH_WRAPPER  = "/tmp/.obt_git_ssh.sh"
+_REMOTE_ASKPASS_PATH = "/tmp/.obt_askpass.sh"
 
 # Known private-key PEM headers used to identify files
 _KEY_HEADERS = (
@@ -249,6 +251,7 @@ class AddonsManager:
 
     def __init__(self, ssh: SSHClient) -> None:
         self._ssh = ssh
+        self._agent_pid: str | None = None  # set by unlock_server_key()
 
     # ── Pre-flight ────────────────────────────────────────────────────────
 
@@ -438,6 +441,117 @@ class AddonsManager:
 
         self._ssh.execute(f"chmod +x {_REMOTE_SSH_WRAPPER}")
 
+    def server_key_needs_passphrase(self, server_key_path: str) -> bool:
+        """
+        Check whether the key at server_key_path — already ON the remote
+        server — is passphrase-protected, without ever reading its bytes
+        off the server (preserves "server mode"'s no-key-transfer promise).
+
+        Runs `ssh-keygen -y` against it with an empty passphrase; OpenSSH
+        reports "incorrect passphrase supplied" when the key is protected.
+
+        Returns:
+            True if the key needs a passphrase. False if it doesn't, OR if
+            the check itself couldn't run (missing ssh-keygen, unreadable
+            path, ...) — in that case the real git operation will surface
+            whatever the actual problem is, same as before this feature.
+        """
+        code, out, err = self._ssh.execute(
+            f"ssh-keygen -y -P '' -f {server_key_path} 2>&1 >/dev/null"
+        )
+        if code == 0:
+            return False
+        return "passphrase" in (out + err).lower()
+
+    def unlock_server_key(
+        self,
+        server_key_path: str,
+        passphrase: str,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Start an ssh-agent ON THE SERVER and decrypt server_key_path into it
+        using the given passphrase — so git can authenticate through the
+        agent instead of needing to read the passphrase-protected file
+        itself (which BatchMode=yes can never prompt for, non-interactively).
+
+        The passphrase is fed to `ssh-add` via a one-shot SSH_ASKPASS script
+        — the standard headless technique, since ssh-add has no other way to
+        accept a passphrase without a controlling terminal. The decrypted
+        key material never leaves the server and lives only in the agent's
+        memory; the askpass script is deleted immediately after use in a
+        try/finally, mirroring cleanup_key()'s pattern for uploaded keys.
+
+        Args:
+            server_key_path: Absolute path to the private key ON THE SERVER.
+            passphrase:      The key's passphrase, collected from the user.
+
+        Returns:
+            A shell env-var prefix (e.g. "SSH_AUTH_SOCK=/tmp/ssh-abc/agent.123 ")
+            to prepend to the git commands run via sync()/execute_long, so
+            they authenticate through this agent. Includes a trailing space.
+
+        Raises:
+            RuntimeError: If the agent could not be started or the
+                          passphrase was rejected.
+        """
+        if log_callback:
+            log_callback("Iniciando ssh-agent en el servidor para desbloquear la llave...")
+
+        code, out, err = self._ssh.execute("ssh-agent -s")
+        if code != 0:
+            raise RuntimeError(f"No se pudo iniciar ssh-agent en el servidor:\n{err}")
+
+        auth_sock = None
+        agent_pid = None
+        for line in out.splitlines():
+            if line.startswith("SSH_AUTH_SOCK="):
+                auth_sock = line.split("=", 1)[1].split(";", 1)[0]
+            elif line.startswith("SSH_AGENT_PID="):
+                agent_pid = line.split("=", 1)[1].split(";", 1)[0]
+        if not auth_sock or not agent_pid:
+            raise RuntimeError("No se pudo interpretar la salida de ssh-agent.")
+        self._agent_pid = agent_pid
+
+        askpass_script = f"#!/bin/sh\necho {shlex.quote(passphrase)}\n".encode("utf-8")
+        sftp = self._ssh.open_sftp()
+        try:
+            with sftp.open(_REMOTE_ASKPASS_PATH, "wb") as fh:
+                fh.write(askpass_script)
+        finally:
+            sftp.close()
+        self._ssh.execute(f"chmod 700 {_REMOTE_ASKPASS_PATH}")
+
+        try:
+            # SSH_ASKPASS_REQUIRE=force makes OpenSSH >= 8.4 use the askpass
+            # script even though setsid gives the process no controlling
+            # terminal to normally trigger that fallback on its own.
+            cmd = (
+                f"SSH_AUTH_SOCK={auth_sock} SSH_ASKPASS={_REMOTE_ASKPASS_PATH} "
+                f"SSH_ASKPASS_REQUIRE=force DISPLAY=:0 setsid ssh-add "
+                f"{server_key_path} < /dev/null 2>&1"
+            )
+            code, out, err = self._ssh.execute(cmd, timeout=20)
+            if code != 0:
+                raise RuntimeError(
+                    "No se pudo desbloquear la llave con la passphrase suministrada.\n"
+                    f"{out or err}\n\n"
+                    "Verifique que la passphrase es correcta."
+                )
+        finally:
+            self._ssh.execute(f"rm -f {_REMOTE_ASKPASS_PATH}")
+
+        if log_callback:
+            log_callback("Llave desbloqueada correctamente en el agente SSH del servidor.")
+
+        return f"SSH_AUTH_SOCK={auth_sock} "
+
+    def stop_agent(self) -> None:
+        """Kill the ssh-agent started by unlock_server_key(), if any."""
+        if self._agent_pid:
+            self._ssh.execute(f"kill {self._agent_pid} 2>/dev/null || true")
+            self._agent_pid = None
+
     def cleanup_key(self, uploaded: bool = True) -> None:
         """
         Remove temporary files from the server.
@@ -461,8 +575,10 @@ class AddonsManager:
         target_path: str,
         odoo_user: str = "odoo",
         use_submodules: bool = False,
+        force_mirror: bool = False,
         log_callback: Callable[[str], None] | None = None,
         cancel_event=None,
+        env_prefix: str = "",
     ) -> bool:
         """
         Clone the repo to target_path (first time) or pull latest (subsequent).
@@ -478,8 +594,25 @@ class AddonsManager:
             use_submodules: If True, run the full git-submodule update sequence
                             after the main clone / pull.  Use this when the repo
                             links other repositories via .gitmodules.
+            force_mirror:   If True, production is forced to become an exact
+                            mirror of the remote branch instead of being
+                            merged with it — see _sync_submodules() docstring
+                            for the full rationale. On an existing checkout
+                            this replaces `git pull` (fetch+merge, which
+                            refuses to run or produces a merge commit when
+                            production has local drift) with
+                            `git fetch && git reset --hard origin/<branch> &&
+                            git clean -fd` — local changes and untracked
+                            files are discarded, never merged. No effect on
+                            a first clone (already a clean mirror by
+                            definition). Destructive — the caller (GUI) must
+                            confirm with the user before setting this.
             log_callback:   Optional progress messages.
             cancel_event:   threading.Event; triggers cancellation when set.
+            env_prefix:     Extra "VAR=value " shell prefix for the git commands
+                             — used to pass SSH_AUTH_SOCK when the server key
+                             was unlocked via unlock_server_key() (passphrase-
+                             protected server-side keys). Empty string otherwise.
 
         Returns:
             True if a fresh clone was performed, False if an existing repo
@@ -517,9 +650,27 @@ class AddonsManager:
                     f"Clonando {repo_url}  ->  {target_path}  (rama: {branch}) ..."
                 )
             cmd = (
-                f"GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
                 f"git clone --branch {branch} --single-branch "
                 f"{repo_url} {target_path}"
+            )
+        elif force_mirror:
+            if log_callback:
+                log_callback(
+                    f"Actualizando addons en {target_path}  (rama: {branch}, "
+                    "modo espejo forzado — descarta cambios locales) ..."
+                )
+            # fetch + reset --hard + clean -fd: the remote branch always
+            # wins, never merges with whatever is on the server. `git pull`
+            # (the non-mirror path below) either refuses to run or produces
+            # a merge commit when production has local drift — neither is
+            # "production is a mirror of the repo" (see docstring above).
+            cmd = (
+                f"cd {target_path} && "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"git fetch origin {branch} && "
+                f"git reset --hard origin/{branch} && "
+                f"git clean -fd"
             )
         else:
             if log_callback:
@@ -528,7 +679,7 @@ class AddonsManager:
                 )
             cmd = (
                 f"cd {target_path} && "
-                f"GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
                 f"git pull origin {branch}"
             )
 
@@ -555,8 +706,10 @@ class AddonsManager:
             self._sync_submodules(
                 target_path,
                 is_first_clone=is_first_clone,
+                force_mirror=force_mirror,
                 log_callback=log_callback,
                 cancel_event=cancel_event,
+                env_prefix=env_prefix,
             )
 
         # Fix ownership so Odoo can read the addon files
@@ -574,8 +727,10 @@ class AddonsManager:
         self,
         target_path: str,
         is_first_clone: bool,
+        force_mirror: bool = False,
         log_callback: Callable[[str], None] | None = None,
         cancel_event=None,
+        env_prefix: str = "",
     ) -> None:
         """
         Run the full git-submodule update sequence inside target_path.
@@ -583,10 +738,29 @@ class AddonsManager:
         On first clone:
           git submodule update --init --recursive
 
-        On subsequent pulls:
+        On subsequent pulls, default (tracking) mode:
           git submodule sync --recursive
           git submodule update --remote --recursive --merge
           git submodule update --init --recursive   (ensures any new submodules)
+
+        `--remote` moves each submodule to the latest commit of ITS OWN
+        tracked branch, independent of whatever commit the superproject's
+        tree actually pins — and `--merge` merges that into whatever is
+        locally checked out instead of discarding local drift. Together
+        that means production ends up reflecting "whatever is newest per
+        submodule", not "exactly what the parent repo records" — not a
+        mirror, and any local submodule edit survives as a merge instead
+        of being overwritten.
+
+        On subsequent pulls, force_mirror=True:
+          git submodule sync --recursive
+          git submodule update --init --recursive --force   (NO --remote, NO --merge —
+              pins each submodule to the EXACT commit the superproject's
+              tree records, discarding local modifications during checkout)
+          git submodule foreach --recursive "git reset --hard && git clean -fd"
+              (belt-and-suspenders: --force above discards changes to
+              tracked files during checkout, but does not by itself remove
+              untracked files left inside a submodule — clean -fd does)
 
         The GIT_SSH wrapper must already be present on the server so that
         submodule fetches authenticate against GitHub / GitLab the same way
@@ -603,7 +777,7 @@ class AddonsManager:
             # Initialize and check out all submodules after a fresh clone
             cmd = (
                 f"cd {target_path} && "
-                f"GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
                 f"git submodule update --init --recursive"
             )
             code, _, err = self._ssh.execute_long(
@@ -618,6 +792,50 @@ class AddonsManager:
                     f"Error inicializando submódulos:\n\n{err}\n\n"
                     "Verifique que la llave tiene acceso a todos los repositorios de submódulos."
                 )
+        elif force_mirror:
+            # 1. Sync URLs from .gitmodules (in case remotes changed)
+            if log_callback:
+                log_callback("  Sincronizando URLs de submódulos...")
+            self._ssh.execute(f"cd {target_path} && git submodule sync --recursive")
+
+            # 2. Pin every submodule to the EXACT commit the superproject's
+            # tree records — no --remote (which would move past that commit
+            # to each submodule's own branch tip) and no --merge (which
+            # would mix local drift into the result). --force discards
+            # local modifications to tracked files during the checkout.
+            if log_callback:
+                log_callback(
+                    "  Fijando submódulos al commit exacto del repositorio "
+                    "(descarta cambios locales) ..."
+                )
+            cmd = (
+                f"cd {target_path} && "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"git submodule update --init --recursive --force"
+            )
+            code, _, err = self._ssh.execute_long(
+                cmd,
+                watch_cmd=f"find {target_path} -name '.git' -mindepth 2 2>/dev/null | wc -l",
+                heartbeat_callback=_heartbeat,
+                timeout=300,
+                cancel_event=cancel_event,
+            )
+            if code != 0:
+                raise RuntimeError(
+                    f"Error fijando submódulos al commit del repositorio:\n\n{err}\n\n"
+                    "Verifique que la llave tiene acceso a todos los repositorios de submódulos."
+                )
+
+            # 3. Belt-and-suspenders: remove any untracked files left inside
+            # submodules (--force above only handles tracked-file drift).
+            if log_callback:
+                log_callback("  Limpiando archivos no rastreados dentro de submódulos...")
+            self._ssh.execute(
+                f"cd {target_path} && "
+                f"git submodule foreach --recursive "
+                f"'git reset --hard && git clean -fd'",
+                timeout=120,
+            )
         else:
             # 1. Sync URLs from .gitmodules (in case remotes changed)
             if log_callback:
@@ -629,7 +847,7 @@ class AddonsManager:
                 log_callback("  Bajando cambios remotos en submódulos...")
             cmd = (
                 f"cd {target_path} && "
-                f"GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
                 f"git submodule update --remote --recursive --merge"
             )
             code, _, err = self._ssh.execute_long(
@@ -650,7 +868,7 @@ class AddonsManager:
                 log_callback("  Inicializando submódulos nuevos (si los hay)...")
             cmd2 = (
                 f"cd {target_path} && "
-                f"GIT_SSH={_REMOTE_SSH_WRAPPER} "
+                f"{env_prefix}GIT_SSH={_REMOTE_SSH_WRAPPER} "
                 f"git submodule update --init --recursive"
             )
             self._ssh.execute_long(
