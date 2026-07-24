@@ -365,31 +365,34 @@ class RestoreManager:
         dest_path = f"{filestore_root}/{db_name}"
         # Staging sits on the same partition as dest so the final mv is instant.
         staging = f"{filestore_root}/{db_name}_obt_tmp"
+        is_tar = zip_path.lower().endswith(".tar")
 
-        # ── Pre-flight: verify unzip is available ─────────────────────────
-        # Only unzip is needed — rsync is no longer used because we move
-        # files within the same partition instead of copying across partitions.
-        code, _, _ = self._ssh.execute("which unzip >/dev/null 2>&1")
-        if code != 0:
-            if log_callback:
-                log_callback("'unzip' no encontrado — intentando instalacion automatica ...")
-            self._ssh.execute(
-                "apt-get install -y unzip 2>/dev/null || "
-                "yum install -y unzip 2>/dev/null || "
-                "apk add --no-cache unzip 2>/dev/null"
-            )
+        # ── Pre-flight: verify the extraction tool is available ───────────
+        # New backups package the filestore as an uncompressed .tar (no zip
+        # CPU cost); older backups still use .zip — detected by extension.
+        # 'tar' ships on every Linux box, so only .zip needs an install check.
+        if not is_tar:
             code, _, _ = self._ssh.execute("which unzip >/dev/null 2>&1")
             if code != 0:
-                raise RuntimeError(
-                    "'unzip' no esta instalado en el servidor destino "
-                    "y la instalacion automatica fallo.\n\n"
-                    "Instale 'unzip' manualmente:\n"
-                    "  Debian/Ubuntu : apt-get install unzip\n"
-                    "  RHEL/CentOS   : yum install unzip\n"
-                    "  Alpine        : apk add unzip"
+                if log_callback:
+                    log_callback("'unzip' no encontrado — intentando instalacion automatica ...")
+                self._ssh.execute(
+                    "apt-get install -y unzip 2>/dev/null || "
+                    "yum install -y unzip 2>/dev/null || "
+                    "apk add --no-cache unzip 2>/dev/null"
                 )
-            if log_callback:
-                log_callback("'unzip' instalado correctamente.")
+                code, _, _ = self._ssh.execute("which unzip >/dev/null 2>&1")
+                if code != 0:
+                    raise RuntimeError(
+                        "'unzip' no esta instalado en el servidor destino "
+                        "y la instalacion automatica fallo.\n\n"
+                        "Instale 'unzip' manualmente:\n"
+                        "  Debian/Ubuntu : apt-get install unzip\n"
+                        "  RHEL/CentOS   : yum install unzip\n"
+                        "  Alpine        : apk add unzip"
+                    )
+                if log_callback:
+                    log_callback("'unzip' instalado correctamente.")
 
         # ── Create staging directory (same partition as dest) ─────────────
         # Any leftover staging from a previous failed attempt is removed first
@@ -404,16 +407,21 @@ class RestoreManager:
             )
 
         # ── Pre-flight: disk-space check on the filestore partition ───────
-        # Query the zip's central directory to get the total uncompressed size
-        # before extracting.  This produces a clear error before any disk I/O
-        # rather than a silent mid-extraction failure.
+        # Determine the uncompressed size before extracting so we can fail
+        # with a clear error instead of a silent mid-extraction failure.
         # The space check targets the filestore partition (where staging lives),
         # NOT /var/tmp — this is the key advantage over the old approach.
-        _, list_out, _ = self._ssh.execute(
-            f"unzip -l {zip_path} 2>/dev/null | tail -1"
-        )
-        # "unzip -l" summary last line: "  <total_bytes>  <n> files"
-        list_parts = list_out.strip().split()
+        # tar is uncompressed, so the archive's own size IS the extracted size;
+        # zip needs its central directory listing to get the uncompressed total.
+        if is_tar:
+            _, size_out, _ = self._ssh.execute(f"stat -c %s {zip_path} 2>/dev/null")
+            list_parts = [size_out.strip()] if size_out.strip().isdigit() else []
+        else:
+            _, list_out, _ = self._ssh.execute(
+                f"unzip -l {zip_path} 2>/dev/null | tail -1"
+            )
+            # "unzip -l" summary last line: "  <total_bytes>  <n> files"
+            list_parts = list_out.strip().split()
         if list_parts and list_parts[0].isdigit():
             try:
                 needed_mb = int(list_parts[0]) // (1024 * 1024) + 200  # 200 MB safety buffer
@@ -443,18 +451,24 @@ class RestoreManager:
             except ValueError:
                 pass  # df output format unexpected — proceed and let unzip report the error
 
-        # ── Extract zip directly into staging ─────────────────────────────
+        # ── Extract archive directly into staging ──────────────────────────
         if log_callback:
-            log_callback(f"Descomprimiendo filestore en {staging} ...")
+            log_callback(f"Extrayendo filestore en {staging} ...")
 
         def _heartbeat_unzip(status: str) -> None:
+            tool = "tar" if is_tar else "unzip"
             if log_callback:
-                log_callback(f"  [unzip en curso] {status}")
+                log_callback(f"  [{tool} en curso] {status}")
 
-        # Omit -q so that unzip errors (e.g. "No space left on device") are
-        # captured in the nohup log and displayed to the user.
+        if is_tar:
+            extract_cmd = f"nice -n 19 tar -xf {zip_path} -C {staging}"
+        else:
+            # Omit -q so that unzip errors (e.g. "No space left on device") are
+            # captured in the nohup log and displayed to the user.
+            extract_cmd = f"nice -n 19 unzip {zip_path} -d {staging}"
+
         code, _, err = self._ssh.execute_long(
-            f"nice -n 19 unzip {zip_path} -d {staging}",
+            extract_cmd,
             watch_cmd=f"du -sh {staging} 2>/dev/null",
             heartbeat_callback=_heartbeat_unzip,
             timeout=3600,
@@ -463,7 +477,7 @@ class RestoreManager:
             # Rollback: remove partial staging so the server stays clean
             self._ssh.execute(f"sudo rm -rf {staging}")
             raise RuntimeError(
-                f"Error descomprimiendo filestore:\n"
+                f"Error extrayendo filestore:\n"
                 f"{err or '(sin detalle — revise espacio en disco en el servidor de restauracion)'}"
             )
 

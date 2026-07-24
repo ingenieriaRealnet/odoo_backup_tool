@@ -115,10 +115,19 @@ class ScheduleManager:
             self._rules = []
 
     def _save(self) -> None:
-        """Persist rules to disk. Must be called with self._lock held."""
+        """
+        Persist rules to disk. Must be called with self._lock held.
+
+        Writes to a temp file then os.replace()'s it into place, so a write
+        that lands mid-way through a scheduler-thread read/tick can never
+        leave schedules.json truncated — an interrupted plain write would be
+        silently treated as corrupt by _load() and reset every rule to empty.
+        """
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(_SCHEDULE_FILE, "w", encoding="utf-8") as fh:
+        tmp_path = _SCHEDULE_FILE.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump({"rules": self._rules}, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, _SCHEDULE_FILE)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -212,21 +221,70 @@ class BackupScheduler:
         profile_mgr,
         notify_queue: queue.Queue,
         poll_interval: int = 60,
+        burst_stagger_secs: int = 120,
+        temp_registry=None,
     ) -> None:
         self._sched   = schedule_mgr
         self._profiles = profile_mgr
         self._q       = notify_queue
         self._interval = poll_interval
+
+        # Shared with the GUI's manual backup flow — a single instance so
+        # both writers see each other's registrations (two independent
+        # RemoteTempRegistry instances would each overwrite the on-disk
+        # manifest with only their own half, silently losing the other's
+        # entries). Falls back to a private instance for standalone/test use.
+        from .temp_registry import RemoteTempRegistry
+        self._temp_registry = temp_registry or RemoteTempRegistry()
         self._stop    = threading.Event()
         self._paused  = threading.Event()   # set = paused, clear = running
         self._active_jobs: dict[str, threading.Thread] = {}
         self._jobs_lock = threading.Lock()
+
+        # Delay between the starts of rules that become due in the SAME poll
+        # tick (a "catch-up burst" — e.g. the tool was closed past several
+        # rules' scheduled times and they all fire together on the next
+        # tick after reopening). Confirmed in the 2026-07-16 stress-test log:
+        # bancasa/equiredes/novalens all fired within the same minute, piled
+        # onto the Drive upload semaphore together, and one (novalens) hung
+        # for ~35 min before failing with a raw SSL error. Staggering the
+        # start of each subsequent rule in the same burst spreads out when
+        # each one reaches Phase B instead of all racing for the semaphore
+        # at once. Manual "Ejecutar ahora" (run_rule_now) is NOT staggered —
+        # only the automatic _tick() burst.
+        self._burst_stagger_secs = burst_stagger_secs
 
         # Cache of DriveUploader instances keyed by (creds_path, folder_id).
         # Reusing instances avoids rebuilding the OAuth service and re-resolving
         # the target folder on every scheduled rule execution.
         self._drive_cache:      dict[tuple, object] = {}
         self._drive_cache_lock: threading.Lock      = threading.Lock()
+
+        # Bounds Drive uploads across concurrently running rules. Phase A
+        # (dump + filestore generation on the source server) still runs fully
+        # in parallel between rules; only Phase B (Drive upload) is capped.
+        # Uploading N clients to Drive at once was the root cause of the
+        # throttling seen in the 2026-07-15 log (mega degraded to 0.6 MB/s
+        # while competing with equiredes/novalens/variedades uploads).
+        # 2 permits (not 1): a single rule's dump + filestore now upload in
+        # parallel to each other (no more bundling for Drive destinations —
+        # see the "Bundle" section below), so 1 permit would have forced
+        # them to queue behind each other and lost that benefit. 2 still
+        # bounds total cross-client concurrency far below the unbounded
+        # free-for-all that caused the 2026-07-15 throttling.
+        self._drive_upload_semaphore = threading.Semaphore(2)
+
+        # Tracks rule labels currently streaming a file to Drive (inside the
+        # semaphore-guarded section of _upload_one_to_drive). Lets the GUI
+        # warn the user before starting a competing manual local download —
+        # a local SFTP download from the same source server competed with
+        # an in-flight Drive upload in the 2026-07-15 log (ARANZAZU download
+        # degraded mega's upload to 0.3 MB/s).
+        # Counter (not a set) — a single rule can have several files uploading
+        # in parallel (dump + filestore + inventory); the label must stay
+        # "active" until the last of them finishes, not the first.
+        self._active_uploads:      dict[str, int] = {}
+        self._active_uploads_lock: threading.Lock = threading.Lock()
 
         self._thread = threading.Thread(
             target=self._loop,
@@ -239,6 +297,30 @@ class BackupScheduler:
     def start(self) -> None:
         """Start the scheduler loop."""
         self._thread.start()
+
+    def has_active_jobs(self) -> bool:
+        """True if any scheduled rule (Phase A or B) is currently running."""
+        with self._jobs_lock:
+            return any(t.is_alive() for t in self._active_jobs.values())
+
+    def has_active_uploads(self) -> bool:
+        """True if any scheduled rule is currently streaming a file to Drive."""
+        with self._active_uploads_lock:
+            return bool(self._active_uploads)
+
+    def active_upload_labels(self) -> list[str]:
+        """Labels of rules currently streaming a file to Drive (for warnings)."""
+        with self._active_uploads_lock:
+            return sorted(self._active_uploads)
+
+    def _mark_upload_active(self, label: str, delta: int) -> None:
+        """Internal: increment/decrement the active-upload counter for label."""
+        with self._active_uploads_lock:
+            count = self._active_uploads.get(label, 0) + delta
+            if count > 0:
+                self._active_uploads[label] = count
+            else:
+                self._active_uploads.pop(label, None)
 
     def stop(self) -> None:
         """Signal the scheduler to stop and wait briefly for it."""
@@ -268,24 +350,83 @@ class BackupScheduler:
     def _tick(self) -> None:
         """Evaluate all rules; fire any that are due and not already running."""
         rules = self._sched.list_rules()
-        for rule in rules:
-            if not rule.get("enabled"):
-                continue
-            if not self._is_due(rule):
-                continue
+
+        # Rules still actively running (e.g. a large upload that hasn't
+        # finished, so its last_run_ts hasn't been updated yet) must NOT
+        # count toward the burst-stagger index below. Confirmed in the
+        # 2026-07-17 log: bancasa's job was still running hours after it
+        # started, so it kept reappearing in the "due" list on every later
+        # tick — inflating burst_index for equiredes/novalens/variedades
+        # even though each of them was the ONLY genuinely new arrival at
+        # its own tick, giving them a pointless 120s "en cola" delay.
+        with self._jobs_lock:
+            active_ids = {rid for rid, t in self._active_jobs.items() if t.is_alive()}
+
+        due_rules = [
+            r for r in rules
+            if r.get("enabled") and self._is_due(r) and r["id"] not in active_ids
+        ]
+
+        for burst_index, rule in enumerate(due_rules):
             rule_id = rule["id"]
             with self._jobs_lock:
                 if rule_id in self._active_jobs and self._active_jobs[rule_id].is_alive():
                     # Job already running for this rule — skip
                     continue
+                # burst_index 0 starts immediately; each subsequent rule due
+                # in this SAME tick is delayed by another _burst_stagger_secs
+                # so a catch-up burst doesn't pile every rule onto the Drive
+                # upload semaphore at once (see __init__ docstring above).
+                delay = burst_index * self._burst_stagger_secs
                 t = threading.Thread(
-                    target=self._run_rule,
-                    args=(rule,),
+                    target=self._run_rule_after_delay,
+                    args=(rule, delay),
                     name=f"sched-job-{rule_id[:8]}",
                     daemon=True,
                 )
                 self._active_jobs[rule_id] = t
             t.start()
+
+    def _run_rule_after_delay(self, rule: dict, delay: float) -> None:
+        """Sleep `delay` seconds (burst stagger), then run the rule."""
+        if delay > 0:
+            label = rule.get("label") or rule.get("db_name", rule["id"][:8])
+            self._log(
+                rule["id"],
+                f"[{label}] En cola — varias reglas vencieron a la vez, "
+                f"inicio programado en {delay}s para no saturar la subida a Drive.",
+            )
+            if self._stop.wait(timeout=delay):
+                return  # scheduler was stopped while this job was queued
+        self._run_rule(rule)
+
+    def run_rule_now(self, rule: dict) -> bool:
+        """
+        Force-run a rule immediately, guarded by the same _active_jobs lock
+        used by _tick(). Used by the GUI's "Ejecutar ahora" button so a
+        manual trigger can never collide with an automatic run of the same
+        rule — both used to be able to fire _run_rule concurrently for the
+        same rule_id, racing on the same /tmp remote file paths (same-minute
+        timestamps) and on cleanup_remote deleting a file the other job was
+        still reading/uploading.
+
+        Returns:
+            True if a new job thread was started, False if the rule was
+            already running (caller should tell the user to wait).
+        """
+        rule_id = rule["id"]
+        with self._jobs_lock:
+            if rule_id in self._active_jobs and self._active_jobs[rule_id].is_alive():
+                return False
+            t = threading.Thread(
+                target=self._run_rule,
+                args=(rule,),
+                name=f"sched-manual-{rule_id[:8]}",
+                daemon=True,
+            )
+            self._active_jobs[rule_id] = t
+        t.start()
+        return True
 
     # ── Due-date logic ────────────────────────────────────────────────────────
 
@@ -409,6 +550,23 @@ class BackupScheduler:
             self._refresh()
             return
 
+        # Tracks remote /tmp files this run creates so they get cleaned up
+        # even if the run is interrupted (crash, force-close, exception)
+        # before reaching its own cleanup code — see core/temp_registry.py.
+        _registered: dict[str, str] = {}
+
+        def _register(path: str, kind: str) -> None:
+            entry_id = self._temp_registry.register(
+                profile["host"], profile["port"], profile["user"], profile["password"],
+                path, kind, label,
+            )
+            _registered[path] = entry_id
+
+        def _unregister(path: str) -> None:
+            entry_id = _registered.pop(path, None)
+            if entry_id:
+                self._temp_registry.unregister(entry_id)
+
         db_mgr = DBManager(ssh)
         fs_mgr = FilestoreManager(ssh)
         tm     = TransferManager(ssh)
@@ -429,18 +587,20 @@ class BackupScheduler:
                     log_callback=log,
                 )
                 remote_tmp.append(dump_path)
+                _register(dump_path, "dump")
                 log(f"[{label}] Dump listo: {dump_path}")
 
             if rule.get("include_filestore") and rule.get("filestore_root"):
                 fs_db   = rule.get("filestore_db") or db_name
-                zip_name = f"filestore_{db_name}_{ts}.zip"
+                zip_name = f"filestore_{db_name}_{ts}.tar"
                 zip_path = f"/tmp/{zip_name}"
-                log(f"[{label}] Comprimiendo filestore: {zip_path}")
+                log(f"[{label}] Empaquetando filestore: {zip_path}")
                 zip_path = fs_mgr.compress_filestore(
                     rule["filestore_root"], fs_db, zip_path,
                     log_callback=log,
                 )
                 remote_tmp.append(zip_path)
+                _register(zip_path, "filestore")
                 log(f"[{label}] Filestore comprimido: {zip_path}")
 
             if not remote_tmp:
@@ -449,41 +609,66 @@ class BackupScheduler:
                 self._sched._update_result(rule_id, "error", msg)
                 return
 
+            # ── Phase B destination (resolved early — the bundle decision
+            # below depends on it) ─────────────────────────────────────────
+            dest_type = rule.get("dest_type", "gdrive")
+
             # ── Bundle: wrap all artifacts into a single .tar ─────────────────
             # Matches the bundle step in gui/app.py _worker_backup.
             # On failure we fall back silently to individual file transfer.
+            #
+            # Skipped entirely for Google Drive destinations: bundling forces
+            # one long sequential upload stream instead of letting dump and
+            # filestore upload to Drive in parallel (optimization plan item 4).
+            # local/remote destinations keep the bundle — it is still useful
+            # there as a single associated deliverable and those transfers
+            # aren't bottlenecked by Drive's per-stream throughput.
             bm = BundleManager(ssh)
             inventory = {
                 "db_name":    db_name,
                 "created_at": ts,
                 "files":      {os.path.basename(p): p for p in remote_tmp},
             }
-            try:
-                bundle_name = BundleManager.bundle_name_for(db_name, ts)
-                bundle_path = f"/tmp/{bundle_name}"
-
-                # Write inventory JSON to server before bundling
-                inv_json_name  = f"{db_name}_{ts}_inventory.json"
+            bundled = False
+            if dest_type == "gdrive":
+                # Still write the inventory JSON so it travels to Drive
+                # alongside dump + filestore, just not wrapped in a .tar.
+                inv_json_name   = f"{db_name}_{ts}_inventory.json"
                 inv_remote_path = f"/tmp/{inv_json_name}"
-                bm.write_json_to_server(inventory, inv_remote_path)
+                try:
+                    bm.write_json_to_server(inventory, inv_remote_path)
+                    remote_tmp.append(inv_remote_path)
+                    _register(inv_remote_path, "inventory")
+                except Exception as inv_exc:  # noqa: BLE001
+                    log(f"[{label}] ADVERTENCIA: no se pudo escribir el inventario. ({inv_exc})")
+            else:
+                try:
+                    bundle_name = BundleManager.bundle_name_for(db_name, ts)
+                    bundle_path = f"/tmp/{bundle_name}"
 
-                all_files = remote_tmp + [inv_remote_path]
-                bm.create(bundle_path, all_files, log_callback=log)
+                    # Write inventory JSON to server before bundling
+                    inv_json_name  = f"{db_name}_{ts}_inventory.json"
+                    inv_remote_path = f"/tmp/{inv_json_name}"
+                    bm.write_json_to_server(inventory, inv_remote_path)
+                    _register(inv_remote_path, "inventory")
 
-                # Remove the individual files — bundle is the single deliverable
-                for f in all_files:
-                    try:
-                        db_mgr.cleanup_remote(f)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    all_files = remote_tmp + [inv_remote_path]
+                    bm.create(bundle_path, all_files, log_callback=log)
+                    _register(bundle_path, "bundle")
 
-                remote_tmp = [bundle_path]
-                log(f"[{label}] Bundle listo: {bundle_name}")
-            except Exception as bundle_exc:  # noqa: BLE001
-                log(f"[{label}] ADVERTENCIA: no se pudo crear bundle, se transferiran archivos individuales. ({bundle_exc})")
+                    # Remove the individual files — bundle is the single deliverable
+                    for f in all_files:
+                        try:
+                            db_mgr.cleanup_remote(f)
+                            _unregister(f)
+                        except Exception:  # noqa: BLE001
+                            pass
 
-            # ── Phase B: transfer to destination ─────────────────────────────
-            dest_type = rule.get("dest_type", "gdrive")
+                    remote_tmp = [bundle_path]
+                    bundled = True
+                    log(f"[{label}] Bundle listo: {bundle_name}")
+                except Exception as bundle_exc:  # noqa: BLE001
+                    log(f"[{label}] ADVERTENCIA: no se pudo crear bundle, se transferiran archivos individuales. ({bundle_exc})")
 
             # Resolve Drive credentials once — used both by the upload helper
             # and by the post-upload retention cleanup.
@@ -497,22 +682,55 @@ class BackupScheduler:
             )
 
             def _upload_one_to_drive(remote_path: str) -> None:
-                """Upload a single remote file to Drive via streaming SFTP."""
+                """Upload a single remote file to Drive via streaming SFTP
+                (relay: server -> this machine -> Drive)."""
                 filename   = os.path.basename(remote_path)
                 uploader   = self._get_uploader(creds_path, folder_id)
                 total_size = tm.get_remote_file_size(remote_path)
                 sftp_sess, sftp_file = tm.open_remote_file(remote_path)
                 try:
-                    log(f"[{label}] Enviando a Drive (streaming): {filename}")
-                    uploader.upload_stream(
-                        sftp_file,
-                        filename,
-                        total_size=total_size,
-                        log_callback=log,
-                    )
+                    with self._drive_upload_semaphore:
+                        self._mark_upload_active(label, +1)
+                        try:
+                            log(f"[{label}] Enviando a Drive (streaming): {filename}")
+                            uploader.upload_stream(
+                                sftp_file,
+                                filename,
+                                total_size=total_size,
+                                log_callback=log,
+                            )
+                        finally:
+                            self._mark_upload_active(label, -1)
                 finally:
                     sftp_file.close()
                     sftp_sess.close()
+
+            # Direct mode (server -> Drive, bypassing this machine's uplink —
+            # see docs/diseno_upload_directo_drive.md) is opt-in per rule via
+            # "upload_mode": "direct", and only ever used if check_viable()
+            # confirms the server itself can reach Google and has/gets rclone.
+            # Any failure here falls back to the relay path above for this
+            # run — direct mode is never forced. No semaphore/mark_upload_active
+            # needed: direct uploads don't consume this machine's bandwidth,
+            # so they don't compete with relay uploads from other rules.
+            use_direct = False
+            if rule.get("upload_mode") == "direct" and dest_type not in ("local", "remote"):
+                from .remote_upload_manager import RemoteUploadManager
+                rum = RemoteUploadManager(
+                    ssh, profile["user"], profile["password"],
+                    temp_registry=self._temp_registry,
+                )
+                viable, why = rum.check_viable()
+                if viable:
+                    use_direct = True
+                    log(f"[{label}] Subida directa servidor->Drive habilitada (rclone).")
+                else:
+                    log(f"[{label}] Modo directo no viable ({why}) — usando modo rele (streaming).")
+
+            def _upload_one_to_drive_direct(remote_path: str) -> None:
+                rum.upload_file(remote_path, creds_path, folder_id, label=label, log_callback=log)
+
+            upload_fn = _upload_one_to_drive_direct if use_direct else _upload_one_to_drive
 
             if dest_type == "local":
                 local_dir = rule.get("dest_local_dir", "")
@@ -553,29 +771,43 @@ class BackupScheduler:
                     )
 
                 if len(remote_tmp) > 1:
-                    # Multiple files (bundle failed — individual dump + filestore).
-                    # Upload them in parallel to cut total time roughly in half.
+                    # Multiple files — the normal case for Drive destinations
+                    # now that bundling is skipped (dump + filestore + inventory
+                    # upload independently). Upload them in parallel, bounded by
+                    # _drive_upload_semaphore, to cut total time roughly in half.
                     log(f"[{label}] Subiendo {len(remote_tmp)} archivos a Drive en paralelo ...")
                     with ThreadPoolExecutor(
                         max_workers=len(remote_tmp),
                         thread_name_prefix=f"drive-upload-{rule_id[:6]}",
                     ) as pool:
                         futures = {
-                            pool.submit(_upload_one_to_drive, rp): rp
+                            pool.submit(upload_fn, rp): rp
                             for rp in remote_tmp
                         }
                         for fut in as_completed(futures):
                             fut.result()  # re-raises any upload exception
                 else:
-                    _upload_one_to_drive(remote_tmp[0])
+                    upload_fn(remote_tmp[0])
 
                 # Retention cleanup — applied once per rule after all uploads succeed.
-                # Bundle naming: "{db_name}_{ts}_obt.tar" → prefix "{db_name}_"
+                # Bundle naming: "{db_name}_{ts}_obt.tar" → prefix "{db_name}_".
+                # Unbundled naming (Drive default, see above) has three distinct
+                # prefixes since dump/filestore/inventory don't share one:
+                #   odoo_{db}_{ts}.dump|sql, filestore_{db}_{ts}.tar|zip,
+                #   {db}_{ts}_inventory.json — a single "{db_name}_" prefix
+                #   would only ever match the inventory file and silently
+                #   leave the actual backup artifacts un-retained.
                 retention = int(rule.get("retention_days", 90))
                 if retention > 0:
                     uploader = self._get_uploader(creds_path, folder_id)
-                    prefix   = f"{db_name}_"
-                    deleted  = uploader.cleanup_old_files(prefix, retention, log_callback=log)
+                    prefixes = (
+                        [f"{db_name}_"]
+                        if bundled
+                        else [f"odoo_{db_name}_", f"filestore_{db_name}_", f"{db_name}_"]
+                    )
+                    deleted = 0
+                    for prefix in prefixes:
+                        deleted += uploader.cleanup_old_files(prefix, retention, log_callback=log)
                     if deleted:
                         log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
 
@@ -584,9 +816,17 @@ class BackupScheduler:
                 for p in remote_tmp:
                     try:
                         db_mgr.cleanup_remote(p)
+                        _unregister(p)
                         log(f"[{label}] Limpiado del servidor: {p}")
                     except Exception:  # noqa: BLE001
                         pass
+            else:
+                # User opted out of cleanup for this rule — these files are
+                # being kept on the server on purpose, so stop tracking them:
+                # the orphan sweep must never delete something intentionally
+                # left in place.
+                for p in remote_tmp:
+                    _unregister(p)
 
             msg = f"Backup completado exitosamente — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             log(f"[{label}] {msg}")

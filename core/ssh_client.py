@@ -6,9 +6,25 @@ and opening SFTP sessions. All state lives in one instance so callers
 don't need to track the underlying paramiko client.
 """
 import socket
+import threading
 import time
+import uuid
 from typing import Callable
 import paramiko
+
+# Inactivity timeout applied to the underlying socket after connecting: if a
+# channel/SFTP read or write goes this long without any data, it raises
+# socket.timeout instead of hanging forever. Mirrors the same fix applied to
+# the Google Drive HTTP client (gdrive.py) — without it, a stalled transfer
+# can block the worker thread indefinitely, and since gui/app.py._on_close()
+# calls SSHClient.close() synchronously on the Tk main thread, that hang used
+# to freeze the entire GUI ("No responde" in Task Manager) instead of the app
+# actually closing.
+_STALL_TIMEOUT_SECS = 180
+
+# Upper bound on how long SSHClient.close() itself will wait for the
+# underlying paramiko close to finish. See close() docstring below.
+_CLOSE_WAIT_SECS = 5
 
 
 class SSHClient:
@@ -64,6 +80,18 @@ class SSHClient:
             self.host = host
             self.port = port
 
+            transport = client.get_transport()
+            if transport is not None:
+                # SSH-level keepalive: detects a silently-dead connection
+                # (peer stopped responding without a clean disconnect) and
+                # closes the transport instead of leaving it looking alive.
+                transport.set_keepalive(30)
+                # Bounds any subsequent blocking socket read/write to
+                # _STALL_TIMEOUT_SECS of inactivity — see module docstring.
+                sock = transport.sock
+                if sock is not None:
+                    sock.settimeout(_STALL_TIMEOUT_SECS)
+
         except paramiko.AuthenticationException:
             raise ConnectionError("Autenticacion fallida: usuario o contrasena incorrectos.")
         except paramiko.SSHException as exc:
@@ -74,13 +102,30 @@ class SSHClient:
             raise ConnectionError(f"Error de red: {exc}")
 
     def close(self) -> None:
-        """Close the SSH connection if open."""
-        if self._client:
-            self._client.close()
-            self._client = None
+        """
+        Close the SSH connection if open.
+
+        Runs paramiko's own close() in a daemon thread and waits at most
+        _CLOSE_WAIT_SECS for it — never blocks the caller indefinitely.
+        paramiko's close() can itself wait on internal transport locks that
+        a still-busy channel in another thread is holding; since this method
+        is called synchronously from the Tk main thread on app shutdown
+        (gui/app.py._on_close), a stuck close() used to freeze the entire
+        GUI ("No responde" in Task Manager) instead of the window actually
+        closing. This instance is considered closed to callers immediately
+        regardless of whether the background close finished — the daemon
+        thread is abandoned and reclaimed by the OS when the process exits.
+        """
+        client = self._client
+        self._client = None
         self.connected = False
         self.host = None
         self.port = None
+        if client is None:
+            return
+        t = threading.Thread(target=client.close, daemon=True)
+        t.start()
+        t.join(timeout=_CLOSE_WAIT_SECS)
 
     # ── Remote execution ─────────────────────────────────────────────────
 
@@ -104,10 +149,25 @@ class SSHClient:
             raise RuntimeError("No hay conexion SSH activa.")
 
         _, stdout, stderr = self._client.exec_command(command, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace").strip()
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        return exit_code, out, err
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+            return exit_code, out, err
+        finally:
+            # paramiko's Transport keeps every exec_command channel registered
+            # internally until this is called explicitly — it is NOT released
+            # by Python garbage collection. execute_long() below calls execute()
+            # multiple times per second (heartbeat + sentinel checks) for the
+            # whole duration of a dump/filestore/upload job; without this close()
+            # each of those calls permanently leaked one channel, so a long job
+            # could accumulate past the remote sshd's MaxSessions limit (10 by
+            # default) and the NEXT exec_command/exec_command-based call (e.g.
+            # BundleManager.create()'s tar) would fail with paramiko's exact
+            # "Unable to open channel" — and, on some servers, enough leaked
+            # channels destabilize the transport enough to drop the whole
+            # connection outright.
+            stdout.channel.close()
 
     def execute_long(
         self,
@@ -145,18 +205,28 @@ class SSHClient:
         if not self.connected or self._client is None:
             raise RuntimeError("No hay conexion SSH activa.")
 
-        sentinel_ok  = "/tmp/.obt_done_ok"
-        sentinel_err = "/tmp/.obt_done_err"
-        pid_file     = "/tmp/.obt_pid"
-
-        # Clean up stale files from a previous run
-        self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file}")
+        # Unique per call: RemoteUploadManager (core/remote_upload_manager.py)
+        # runs several execute_long() calls concurrently on the SAME SSHClient
+        # (dump/filestore/inventory uploading in parallel via ThreadPoolExecutor
+        # — see scheduler.py._run_rule). Fixed sentinel paths used to collide
+        # across those concurrent calls: one call's "rm -f" at the start could
+        # wipe another's in-flight sentinel, or a call could pick up the
+        # sentinel left by a DIFFERENT command and report done/failed
+        # prematurely. Confirmed 2026-07-22: the filestore upload was marked
+        # complete before it actually finished (its rclone check then failed
+        # with "file not in Google drive root") because a concurrent dump/
+        # inventory upload's sentinel was mistaken for its own.
+        call_id      = uuid.uuid4().hex[:8]
+        sentinel_ok  = f"/tmp/.obt_done_ok_{call_id}"
+        sentinel_err = f"/tmp/.obt_done_err_{call_id}"
+        pid_file     = f"/tmp/.obt_pid_{call_id}"
+        nohup_log    = f"/tmp/.obt_nohup_{call_id}.log"
 
         # Launch command detached; save its PID so we can kill it if needed
         wrapped = (
             f"nohup bash -c '{command} "
             f"&& touch {sentinel_ok} || touch {sentinel_err}' "
-            f"> /tmp/.obt_nohup.log 2>&1 & echo $! > {pid_file}"
+            f"> {nohup_log} 2>&1 & echo $! > {pid_file}"
         )
         self.execute(wrapped)
 
@@ -201,20 +271,30 @@ class SSHClient:
                         f"pkill -KILL -P {pid} 2>/dev/null || true; "
                         f"kill -KILL {pid} 2>/dev/null || true"
                     )
-                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file}")
+                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file} {nohup_log}")
                 raise RuntimeError("__CANCELLED__")
 
             # ── Heartbeat ─────────────────────────────────────────────────
             if elapsed % heartbeat_interval == 0 and watch_cmd and heartbeat_callback:
                 try:
                     _, w_out, _ = self._client.exec_command(watch_cmd)
-                    msg = w_out.read().decode("utf-8", errors="replace").strip()
-                    heartbeat_callback(msg if msg else "... en proceso ...")
+                    try:
+                        msg = w_out.read().decode("utf-8", errors="replace").strip()
+                        heartbeat_callback(msg if msg else "... en proceso ...")
+                    finally:
+                        # See execute()'s finally block: exec_command channels
+                        # are never released by paramiko unless closed here.
+                        w_out.channel.close()
                 except Exception:
                     heartbeat_callback("... en proceso ...")
 
             # ── Timeout guard ─────────────────────────────────────────────
             if elapsed >= timeout:
+                # Only clears our own tracking files (tiny, harmless if
+                # left behind) — deliberately does NOT kill the remote
+                # process: like pg_dump/tar, it's running detached via
+                # nohup and may legitimately still finish on its own.
+                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file} {nohup_log}")
                 raise RuntimeError(
                     f"Timeout: el comando supero {timeout}s sin terminar."
                 )
@@ -224,13 +304,13 @@ class SSHClient:
             err_code, _, _ = self.execute(f"test -f {sentinel_err}")
 
             if ok_code == 0:
-                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file}")
+                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file} {nohup_log}")
                 return 0, "", ""
 
             if err_code == 0:
-                _, nohup_log, _ = self.execute("cat /tmp/.obt_nohup.log 2>/dev/null")
-                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file}")
-                return 1, "", nohup_log
+                _, log_content, _ = self.execute(f"cat {nohup_log} 2>/dev/null")
+                self.execute(f"rm -f {sentinel_ok} {sentinel_err} {pid_file} {nohup_log}")
+                return 1, "", log_content
 
     # ── SFTP ─────────────────────────────────────────────────────────────
 

@@ -21,6 +21,10 @@ if not exist icon.ico (
 )
 
 echo.
+echo  Cerrando instancias de OdooBackupTool.exe en ejecucion (bloquean el archivo)...
+taskkill /F /IM OdooBackupTool.exe >nul 2>&1
+
+echo.
 echo  Compilando ejecutable...
 pyinstaller ^
     --onefile ^
@@ -37,6 +41,8 @@ pyinstaller ^
     --hidden-import PIL.Image ^
     --hidden-import google.oauth2.service_account ^
     --hidden-import google.auth.transport.requests ^
+    --hidden-import google_auth_httplib2 ^
+    --hidden-import httplib2 ^
     --hidden-import googleapiclient.discovery ^
     --hidden-import googleapiclient.http ^
     --hidden-import googleapiclient.errors ^
@@ -47,11 +53,20 @@ pyinstaller ^
     --add-data "icon.ico;." ^
     main.py
 
+set PYI_EXITCODE=%ERRORLEVEL%
+
 echo.
-if exist output\dist\OdooBackupTool.exe (
+REM Verifica el codigo de salida real de PyInstaller, no solo si el .exe
+REM existe: un build fallido (p.ej. PermissionError porque el .exe anterior
+REM seguia abierto) deja el archivo VIEJO en su lugar, y "if exist" por si
+REM solo reportaria "LISTO" con un ejecutable desactualizado.
+if not "%PYI_EXITCODE%"=="0" (
+    echo  ERROR: PyInstaller termino con codigo %PYI_EXITCODE%. Revisa los mensajes anteriores.
+    echo  El archivo en output\dist\OdooBackupTool.exe, si existe, es el build ANTERIOR — no se actualizo.
+) else if exist output\dist\OdooBackupTool.exe (
     echo  LISTO: output\dist\OdooBackupTool.exe generado correctamente.
 ) else (
-    echo  ERROR: no se genero el ejecutable. Revisa los mensajes anteriores.
+    echo  ERROR: PyInstaller reporto exito pero no se encontro el ejecutable. Revisa los mensajes anteriores.
 )
 echo.
 pause

@@ -12,6 +12,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 import tkinter as tk
 import re
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -34,6 +35,7 @@ from gui.ssh_terminal_panel import SshTerminalPanel
 from core.trial_manager import TrialManager
 from core.scheduler import ScheduleManager, BackupScheduler
 from core.bundle_manager import BundleManager
+from core.temp_registry import RemoteTempRegistry, sweep_orphaned_files
 
 def _add_timestamp(filename: str) -> str:
     """Insert a timestamp before the file extension: file.dump → file_2026-06-25_14-03.dump"""
@@ -156,6 +158,22 @@ _KW_LOG_RE = re.compile(
 APP_TITLE = "Odoo Backup Tool"
 _PAD = 8
 
+# _on_close(): a backup/restore "in progress" whose last queue activity (log
+# line, progress update, ...) is older than this is treated as frozen/stuck
+# rather than genuinely active — closing skips the confirmation prompt in
+# that case since there is nothing real to interrupt. Comfortably above the
+# normal gap between progress lines (heartbeats every ~15s, Drive % updates
+# every few seconds to a couple minutes even when degraded) but well under
+# the 180s socket inactivity timeout in ssh_client.py, so the user gets an
+# immediate, informed choice instead of waiting for the network layer to
+# eventually time out on its own.
+_FROZEN_ACTIVITY_THRESHOLD_SECS = 90
+
+# Sentinel value shown as the first option in every profile combobox.
+# Selecting it is equivalent to "no profile selected" — triggers the
+# create-new-profile path when the user clicks Guardar.
+_PROFILE_NEW = "— Nuevo perfil —"
+
 # Persistent settings file (geometry, sash position)
 _SETTINGS_FILE = os.path.join(
     os.path.expanduser("~"), ".odoo_backup_tool", "settings.json"
@@ -222,6 +240,7 @@ class _ScheduleDialog(tk.Toplevel):
         self._v_retention    = tk.StringVar(value=str(r.get("retention_days", 90)))
         self._v_cleanup      = tk.BooleanVar(value=r.get("cleanup_server", True))
         self._v_enabled      = tk.BooleanVar(value=r.get("enabled", True))
+        self._v_upload_direct= tk.BooleanVar(value=r.get("upload_mode") == "direct")
 
         # ── Layout ────────────────────────────────────────────────────────
         self.columnconfigure(0, weight=1)
@@ -333,6 +352,17 @@ class _ScheduleDialog(tk.Toplevel):
                    )).grid(row=0, column=1)
         ttk.Label(self._pnl_gdrive, text="Carpeta Drive (ID):").grid(row=1, column=0, sticky="e", padx=(0, _PAD), pady=4)
         ttk.Entry(self._pnl_gdrive, textvariable=self._v_gdrive_folder).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Checkbutton(
+            self._pnl_gdrive,
+            text="Subida directa servidor -> Drive (rclone, evita el relé por esta máquina)",
+            variable=self._v_upload_direct,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        ttk.Label(
+            self._pnl_gdrive,
+            text="Si el servidor no tiene salida a Google o no se puede instalar rclone,\n"
+                 "esta regla usa el modo relé (streaming) de todos modos.",
+            foreground="#666666",
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
 
         # Local panel
         self._pnl_local = ttk.Frame(content)
@@ -470,6 +500,7 @@ class _ScheduleDialog(tk.Toplevel):
             "schedule_minute":      minute,
             "retention_days":       int(self._v_retention.get() or 90),
             "cleanup_server":       self._v_cleanup.get(),
+            "upload_mode":          "direct" if self._v_upload_direct.get() else "relay",
         }
         self.destroy()
 
@@ -499,6 +530,12 @@ class BackupApp:
 
         # Schedule rules manager (shared with BackupScheduler)
         self._sched_mgr = ScheduleManager()
+
+        # Registry of remote /tmp files this tool has created but not yet
+        # confirmed deleting — shared with BackupScheduler so both the
+        # manual flow and scheduled runs write to the same on-disk manifest.
+        # See core/temp_registry.py.
+        self._temp_registry = RemoteTempRegistry()
 
         # ── Backup state variables ────────────────────────────────────────
         self._v_db = tk.StringVar()
@@ -534,7 +571,7 @@ class BackupApp:
         self._v_r_dump_srv   = tk.StringVar(value="/tmp/odoo_bancasa_prod.dump")
         self._v_r_fs_src     = tk.StringVar(value="local") # 'local' | 'server' | 'none'
         self._v_r_fs_local   = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
-        self._v_r_fs_srv     = tk.StringVar(value="/tmp/filestore_bancasa_prod.zip")
+        self._v_r_fs_srv     = tk.StringVar(value="/tmp/filestore_bancasa_prod.tar")
         self._v_r_db_name    = tk.StringVar()
         self._v_r_fs_root    = tk.StringVar()
         self._v_r_jobs       = tk.StringVar(value="4")
@@ -547,11 +584,12 @@ class BackupApp:
         self._v_a_conn_type  = tk.StringVar(value="origin")
         self._v_a_repo_url   = tk.StringVar()
         self._v_a_branch     = tk.StringVar(value="main")
-        self._v_a_target     = tk.StringVar(value="/opt/odoo/addons_custom")
+        self._v_a_target     = tk.StringVar(value="/usr/lib/python3/dist-packages/odoo/addons_custom")
         self._v_a_odoo_user  = tk.StringVar(value="odoo")
         self._v_a_restart      = tk.BooleanVar(value=False)
         self._v_a_service      = tk.StringVar(value="odoo")
         self._v_a_submodules   = tk.BooleanVar(value=False)  # use git submodule update sequence
+        self._v_a_force_mirror = tk.BooleanVar(value=False)  # discard local drift, remote always wins
 
         # SSH key source priority cascade:
         #   "server"   — key already on the remote server's ~/.ssh/
@@ -566,6 +604,10 @@ class BackupApp:
         # Per-session passphrase cache keyed by key path — NEVER written to disk.
         # Cleared automatically when the app closes.
         self._key_passphrases: dict[str, str] = {}
+        # Same, for server-side keys (Tab 7 "server" mode) — keyed by
+        # "{host}:{server_key_path}" since these are remote paths, not local
+        # ones. See _action_sync_addons / AddonsManager.unlock_server_key.
+        self._server_key_passphrases: dict[str, str] = {}
 
         # Cancellation flag shared between GUI and worker threads
         self._cancel_event = threading.Event()
@@ -589,8 +631,24 @@ class BackupApp:
 
         # Start the backup scheduler daemon thread.
         # It shares self._q so schedule events land in the same poll loop.
-        self._scheduler = BackupScheduler(self._sched_mgr, self._profiles, self._q)
+        self._scheduler = BackupScheduler(
+            self._sched_mgr, self._profiles, self._q,
+            temp_registry=self._temp_registry,
+        )
         self._scheduler.start()
+
+        # Sweep orphaned remote /tmp files left behind by a crash, a failed
+        # job, or the app being force-closed last session — see
+        # core/temp_registry.py. Runs in a background thread so a slow/
+        # unreachable server never delays app startup.
+        threading.Thread(target=self._sweep_orphaned_temp_files, daemon=True).start()
+
+        # Timestamp of the last message drained from self._q (any kind — log,
+        # progress, sched_log, ...), refreshed in _poll_queue(). Used by
+        # _on_close() to tell a genuinely active backup/restore apart from
+        # one that's actually stuck/frozen (no progress for a while) — see
+        # _on_close() docstring.
+        self._last_activity_ts = time.monotonic()
 
     # ── Theme / Style ─────────────────────────────────────────────────────
 
@@ -1355,10 +1413,12 @@ class BackupApp:
             return
 
         db_mgr = DBManager(self._ssh)
+        src_host = self._retry_conn_params.get("src_host", self._ssh.host)
         for path in self._retry_remote_tmp:
             try:
                 self._log(f"Limpiando {path} del servidor ...")
                 db_mgr.cleanup_remote(path)
+                self._temp_registry.unregister_path(src_host, path)
             except Exception as exc:
                 self._log(f"[aviso] No se pudo limpiar {path}: {exc}")
 
@@ -1470,8 +1530,9 @@ class BackupApp:
 
         self._cb_profile = ttk.Combobox(
             pnl_prof, state="readonly",
-            values=self._profiles.names(),
+            values=[_PROFILE_NEW] + self._profiles.names(),
         )
+        self._cb_profile.set(_PROFILE_NEW)
         self._cb_profile.grid(row=0, column=0, padx=(0, _PAD), pady=2, sticky="ew")
         self._cb_profile.bind("<<ComboboxSelected>>", lambda e: self._load_profile())
 
@@ -1575,8 +1636,9 @@ class BackupApp:
 
         self._cb_r_profile = ttk.Combobox(
             pnl_b_prof, state="readonly",
-            values=self._profiles.names(),
+            values=[_PROFILE_NEW] + self._profiles.names(),
         )
+        self._cb_r_profile.set(_PROFILE_NEW)
         self._cb_r_profile.grid(row=0, column=0, padx=(0, _PAD), pady=2, sticky="ew")
         self._cb_r_profile.bind("<<ComboboxSelected>>", lambda e: self._load_r_profile())
 
@@ -1772,8 +1834,9 @@ class BackupApp:
 
         self._cb_d_profile = ttk.Combobox(
             pnl_d_prof, state="readonly",
-            values=self._profiles.names(),
+            values=[_PROFILE_NEW] + self._profiles.names(),
         )
+        self._cb_d_profile.set(_PROFILE_NEW)
         self._cb_d_profile.grid(row=0, column=0, padx=(0, _PAD), pady=2, sticky="ew")
         self._cb_d_profile.bind("<<ComboboxSelected>>", lambda e: self._load_d_profile())
 
@@ -2121,15 +2184,16 @@ class BackupApp:
 
     def _refresh_profile_combos(self) -> None:
         """Sync all profile comboboxes with the current profile list."""
-        names = self._profiles.names()
-        self._cb_profile["values"]   = names
-        self._cb_d_profile["values"] = names
-        self._cb_r_profile["values"] = names
+        names  = self._profiles.names()
+        values = [_PROFILE_NEW] + names
+        self._cb_profile["values"]   = values
+        self._cb_d_profile["values"] = values
+        self._cb_r_profile["values"] = values
 
     def _load_profile(self) -> None:
         """Fill Tab-1 connection fields from the selected profile."""
         name = self._cb_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             return
         p = self._profiles.get(name)
         if p:
@@ -2151,6 +2215,8 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
         existing = self._cb_profile.get()
+        if existing == _PROFILE_NEW:
+            existing = ""
         if existing:
             # Editing an existing profile — confirm and overwrite directly
             if not messagebox.askyesno(
@@ -2186,19 +2252,19 @@ class BackupApp:
     def _delete_profile(self) -> None:
         """Delete the selected profile from the backup profile combobox."""
         name = self._cb_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             messagebox.showwarning(APP_TITLE, "Seleccione un perfil para eliminar.")
             return
         if not messagebox.askyesno(APP_TITLE, f'¿Eliminar el perfil "{name}"?'):
             return
         self._profiles.delete(name)
         self._refresh_profile_combos()
-        self._cb_profile.set("")
+        self._cb_profile.set(_PROFILE_NEW)
 
     def _load_d_profile(self) -> None:
         """Fill Tab-4 destination server fields from the selected profile."""
         name = self._cb_d_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             return
         p = self._profiles.get(name)
         if p:
@@ -2218,6 +2284,8 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
         existing = self._cb_d_profile.get()
+        if existing == _PROFILE_NEW:
+            existing = ""
         if existing:
             if not messagebox.askyesno(
                 APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
@@ -2249,19 +2317,19 @@ class BackupApp:
     def _delete_d_profile(self) -> None:
         """Delete the selected profile from the destination profile combobox."""
         name = self._cb_d_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             messagebox.showwarning(APP_TITLE, "Seleccione un perfil para eliminar.")
             return
         if not messagebox.askyesno(APP_TITLE, f'¿Eliminar el perfil "{name}"?'):
             return
         self._profiles.delete(name)
         self._refresh_profile_combos()
-        self._cb_d_profile.set("")
+        self._cb_d_profile.set(_PROFILE_NEW)
 
     def _load_r_profile(self) -> None:
         """Fill Servidor B connection fields from the selected profile."""
         name = self._cb_r_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             return
         p = self._profiles.get(name)
         if p:
@@ -2280,6 +2348,8 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese los datos de conexion primero.")
             return
         existing = self._cb_r_profile.get()
+        if existing == _PROFILE_NEW:
+            existing = ""
         if existing:
             if not messagebox.askyesno(
                 APP_TITLE, f'¿Actualizar el perfil "{existing}" con los datos actuales?'
@@ -2314,14 +2384,14 @@ class BackupApp:
     def _delete_r_profile(self) -> None:
         """Delete the selected profile from the restore profile combobox."""
         name = self._cb_r_profile.get()
-        if not name:
+        if not name or name == _PROFILE_NEW:
             messagebox.showwarning(APP_TITLE, "Seleccione un perfil para eliminar.")
             return
         if not messagebox.askyesno(APP_TITLE, f'¿Eliminar el perfil "{name}"?'):
             return
         self._profiles.delete(name)
         self._refresh_profile_combos()
-        self._cb_r_profile.set("")
+        self._cb_r_profile.set(_PROFILE_NEW)
 
     # ── Pre-flight validation helpers ────────────────────────────────────
 
@@ -2661,6 +2731,23 @@ class BackupApp:
         if not self._check_ssh_alive(self._ssh, "origen"):
             return
 
+        # Warn before a manual local download while a scheduled Drive upload
+        # is in flight: both compete for the source server's network egress.
+        # In the 2026-07-15 log, a local SFTP download (ARANZAZU) degraded a
+        # concurrent Drive upload (mega) from ~2 MB/s to 0.3 MB/s.
+        if self._v_dest_type.get() == "local" and self._scheduler.has_active_uploads():
+            labels = ", ".join(self._scheduler.active_upload_labels())
+            if not messagebox.askyesno(
+                "Subida en curso",
+                "Hay un backup programado subiendo a Google Drive ahora mismo "
+                f"({labels}).\n\n"
+                "Descargar en paralelo por SFTP puede competir por el ancho de "
+                "banda del servidor origen y degradar ambas transferencias.\n\n"
+                "¿Desea continuar de todas formas?",
+                parent=self.root,
+            ):
+                return
+
         self._btn_run.config(state="disabled")
         self._v_progress.set(0)
         self._lbl_progress.config(text="")
@@ -2678,6 +2765,13 @@ class BackupApp:
             "inc_fs": self._v_inc_fs.get(),
             "cleanup": self._v_cleanup.get(),
             "bundle": self._v_bundle.get(),
+            # Origin server credentials — needed to register remote /tmp
+            # files with self._temp_registry (SSHClient itself only keeps
+            # host/port, not user/password, after connecting).
+            "src_host": self._cv["host"].get().strip(),
+            "src_port": int(self._cv["port"].get().strip() or 22),
+            "src_user": self._cv["user"].get().strip(),
+            "src_pass": self._cv["pass"].get(),
         }
         if params["dest_type"] == "remote":
             params["dest_host"] = self._dv["host"].get()
@@ -2714,6 +2808,23 @@ class BackupApp:
         inventory: dict | None = None
         final_dump_fname: str = ""   # resolved after overwrite dialog
         dump_path: str = ""          # set only when inc_db=True
+
+        # Tracks remote /tmp files this run creates so they get cleaned up
+        # even if the run is interrupted before reaching its own cleanup
+        # code — see core/temp_registry.py. Mirrors the same pattern used
+        # by BackupScheduler._run_rule for scheduled backups. Unregistering
+        # by (host, path) rather than by id means the retry flow
+        # (_worker_transfer_only, a separate thread/closure reusing the same
+        # `p` dict) and the manual "delete without transferring" action can
+        # unregister these files too without needing this closure's state.
+        def _register(path: str, kind: str) -> None:
+            self._temp_registry.register(
+                p["src_host"], p["src_port"], p["src_user"], p["src_pass"],
+                path, kind, p["db"],
+            )
+
+        def _unregister(path: str) -> None:
+            self._temp_registry.unregister_path(p["src_host"], path)
 
         # ── Phase A: create files on the server (not retryable) ──────────
         try:
@@ -2760,6 +2871,7 @@ class BackupApp:
                     cancel_event=self._cancel_event,
                 )
                 remote_tmp.append(dump_path)
+                _register(dump_path, "dump")
                 final_dump_fname = dump_fname   # track resolved filename for inventory naming
                 advance(f"Dump listo: {dump_path}")
 
@@ -2784,7 +2896,8 @@ class BackupApp:
                     cancel_event=self._cancel_event,
                 )
                 remote_tmp.append(fs_path)
-                advance(f"Filestore comprimido: {fs_path}")
+                _register(fs_path, "filestore")
+                advance(f"Filestore empaquetado: {fs_path}")
 
         except RuntimeError as exc:
             if str(exc) == "__CANCELLED__":
@@ -2813,15 +2926,18 @@ class BackupApp:
                     inv_json_name   = f"{p['db']}_{ts}_inventory.json"
                     inv_remote_path = f"/tmp/{inv_json_name}"
                     bm.write_json_to_server(inventory, inv_remote_path)
+                    _register(inv_remote_path, "inventory")
                     self._log(f"Inventario escrito en servidor: {inv_remote_path}")
 
                 all_files = remote_tmp + ([inv_remote_path] if inv_remote_path else [])
                 bm.create(bundle_path_remote, all_files, log_callback=self._log)
+                _register(bundle_path_remote, "bundle")
 
                 # Remove individual files — they are now inside the .tar
                 db_mgr_cleanup = DBManager(self._ssh)
                 for f in all_files:
                     db_mgr_cleanup.cleanup_remote(f)
+                    _unregister(f)
 
                 # Replace the file list with just the single bundle
                 remote_tmp = [bundle_path_remote]
@@ -2836,7 +2952,7 @@ class BackupApp:
         # Any error here shows the retry panel so the user can change the
         # destination and re-run the transfer without recreating the dump/zip.
         try:
-            self._exec_transfer_and_finish(p, remote_tmp, dump_path, inventory, advance)
+            self._exec_transfer_and_finish(p, remote_tmp, dump_path, inventory, advance, _unregister)
 
         except RuntimeError as exc:
             if str(exc) == "__CANCELLED__":
@@ -2867,6 +2983,7 @@ class BackupApp:
         dump_path: str,
         inventory: dict | None,
         advance_fn,
+        unregister_fn=None,
     ) -> None:
         """
         Steps 3-5: transfer files to destination, server cleanup, save inventory.
@@ -2875,14 +2992,22 @@ class BackupApp:
         and decide whether to show the retry panel or report a fatal error.
 
         Args:
-            p:           Full backup params dict (dest_type, connection info, etc.).
-            remote_tmp:  List of absolute paths on the source server ready to transfer.
-            dump_path:   Path of the DB dump on the server (used to name the inventory).
-            inventory:   Inventory dict collected before the dump, or None.
-            advance_fn:  Callable(label) that increments the progress bar step counter.
+            p:            Full backup params dict (dest_type, connection info, etc.).
+            remote_tmp:   List of absolute paths on the source server ready to transfer.
+            dump_path:    Path of the DB dump on the server (used to name the inventory).
+            inventory:    Inventory dict collected before the dump, or None.
+            advance_fn:   Callable(label) that increments the progress bar step counter.
+            unregister_fn: Callable(path) to drop a file from the orphan-cleanup
+                registry once deleted (core/temp_registry.py). Defaults to
+                unregistering by (p["src_host"], path) directly so callers
+                that didn't build their own closure (the retry flow) still
+                get correct cleanup tracking.
         """
         db_mgr   = DBManager(self._ssh)
         transfer = TransferManager(self._ssh)
+
+        if unregister_fn is None:
+            unregister_fn = lambda path: self._temp_registry.unregister_path(p["src_host"], path)
 
         # ── 3. Transfer each file ─────────────────────────────────────────
         final_dump_fname: str = ""
@@ -2975,6 +3100,13 @@ class BackupApp:
             for remote_file in remote_tmp:
                 self._log(f"Limpiando {remote_file} del servidor ...")
                 db_mgr.cleanup_remote(remote_file)
+                unregister_fn(remote_file)
+        else:
+            # User opted out of cleanup — these files are being kept on the
+            # server on purpose, so stop tracking them: the orphan sweep
+            # must never delete something intentionally left in place.
+            for remote_file in remote_tmp:
+                unregister_fn(remote_file)
 
         # ── 5. Save inventory ─────────────────────────────────────────────
         if inventory and final_dump_fname:
@@ -3057,11 +3189,26 @@ class BackupApp:
         """Queue a log message from any thread."""
         self._q.put(("log", msg))
 
+    def _sweep_orphaned_temp_files(self) -> None:
+        """
+        Background-thread entry point: delete remote /tmp files this tool
+        created in a previous run and never confirmed cleaning up (crash,
+        force-close, or a job that failed before reaching its own cleanup).
+        See core/temp_registry.py for why the manifest is safe to trust.
+        """
+        try:
+            deleted = sweep_orphaned_files(self._temp_registry, log_callback=self._log)
+            if deleted:
+                self._log(f"[limpieza-huerfanos] {deleted} archivo(s) huerfano(s) eliminados del servidor.")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[limpieza-huerfanos] Error durante el barrido: {exc}")
+
     def _poll_queue(self) -> None:
         """Drain the message queue and update the GUI (called every 100 ms)."""
         try:
             while True:
                 event, data = self._q.get_nowait()
+                self._last_activity_ts = time.monotonic()
 
                 if event == "log":
                     self._append_log(data)
@@ -3549,7 +3696,7 @@ class BackupApp:
         self._r_fs_local_entry = ttk.Entry(pi, textvariable=self._v_r_fs_local, width=38)
         self._r_fs_local_entry.grid(row=5, column=1, sticky="ew", padx=(4, 4))
         ttk.Button(pi, text="...", width=3,
-            command=lambda: self._browse_file(self._v_r_fs_local, "*.zip")
+            command=lambda: self._browse_file(self._v_r_fs_local, "*.zip *.tar")
         ).grid(row=5, column=2)
 
         ttk.Radiobutton(
@@ -3834,7 +3981,7 @@ class BackupApp:
                 if db:
                     self._v_r_dump_srv.set(f"{dest_dir}/odoo_{db}.{ext}")
                 if fs_db:
-                    self._v_r_fs_srv.set(f"{dest_dir}/filestore_{fs_db}.zip")
+                    self._v_r_fs_srv.set(f"{dest_dir}/filestore_{fs_db}.tar")
 
                 # Switch sources to "server" so the auto-filled paths are active
                 self._v_r_dump_src.set("server")
@@ -4334,7 +4481,7 @@ class BackupApp:
             ("URL SSH del repo:",   self._v_a_repo_url,  False,
              "git@github.com:mi-org/mi-repo.git"),
             ("Rama (branch):",      self._v_a_branch,    False, "main"),
-            ("Ruta en servidor:",   self._v_a_target,    False, "/opt/odoo/addons_custom"),
+            ("Ruta en servidor:",   self._v_a_target,    False, "/usr/lib/python3/dist-packages/odoo/addons_custom"),
             ("Usuario Odoo (OS):",  self._v_a_odoo_user, False, "odoo"),
         ]
         for i, (lbl, var, _show, placeholder) in enumerate(_fields_s2):
@@ -4372,19 +4519,25 @@ class BackupApp:
 
         ttk.Radiobutton(
             repo_type_frame,
-            text="Git normal  (git pull)",
+            text="Git normal",
             variable=self._v_a_submodules, value=False,
         ).pack(side="left", padx=(0, 12))
         ttk.Radiobutton(
             repo_type_frame,
-            text="Git con submódulos  (git submodule update --remote --recursive --merge)",
+            text="Git con submódulos",
             variable=self._v_a_submodules, value=True,
         ).pack(side="left")
 
+        # El comando exacto usado por cada modo depende tambien del checkbox
+        # "Modo espejo forzado" en la Seccion 4 (Opciones) — no se fija aqui
+        # en texto estatico para evitar que quede desactualizado; el log de
+        # la Seccion 5 ya distingue el comando real corrido en cada caso.
         ttk.Label(
             sec2,
-            text="  Usa 'Git con submódulos' si el repo principal enlaza otros repos via .gitmodules",
-            font=("Segoe UI", 8), foreground="#888888",
+            text="  Usa 'Git con submódulos' si el repo principal enlaza otros repos via .gitmodules.\n"
+                 "  Por defecto trae los ultimos cambios (git pull / --remote --merge); ver 'Modo\n"
+                 "  espejo forzado' en Opciones para que el repositorio remoto siempre sobrescriba.",
+            font=("Segoe UI", 8), foreground="#888888", justify="left",
         ).grid(row=n_fields + 2, column=0, columnspan=2, sticky="w", pady=(0, 2))
 
         # ── Seccion 3: Llave SSH ──────────────────────────────────────────
@@ -4579,6 +4732,25 @@ class BackupApp:
             command=self._action_detect_service,
         )
         self._btn_detect_svc.grid(row=0, column=1)
+
+        ttk.Separator(sec4, orient="horizontal").grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=6
+        )
+
+        ttk.Checkbutton(
+            sec4,
+            text="Modo espejo forzado (el repositorio SIEMPRE gana, nunca mezcla)",
+            variable=self._v_a_force_mirror,
+        ).grid(row=3, column=0, columnspan=3, sticky="w")
+        tk.Label(
+            sec4,
+            text="  Descarta cualquier cambio local en el servidor (git reset --hard + "
+                 "git clean -fd). Con submodulos: los fija al commit exacto que el "
+                 "repositorio tiene anclado (sin --remote, sin --merge). Producción queda "
+                 "identica al repositorio remoto — irreversible.",
+            font=("Segoe UI", 8), fg="#E67E22", bg=_C_BG,
+            wraplength=480, justify="left",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
         # ── Seccion 5: Progreso y ejecucion ──────────────────────────────
         sec5 = ttk.LabelFrame(f, text="5. Ejecucion", padding=_PAD)
@@ -4842,10 +5014,20 @@ class BackupApp:
             messagebox.showwarning(APP_TITLE, "Ingrese la ruta destino en el servidor.")
             return
 
+        try:
+            ssh = self._get_addons_ssh()
+        except RuntimeError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
+        if not self._check_ssh_alive(ssh, "addons"):
+            return
+
         # Validate the selected key source
         server_key = None
         local_key  = None
         passphrase = None
+        server_passphrase = None
 
         if key_source == "server":
             server_key = self._v_a_server_key.get().strip()
@@ -4856,6 +5038,35 @@ class BackupApp:
                     "o cambie a uno de los otros modos de llave SSH.",
                 )
                 return
+            # The server key never leaves the server, so the app can't check
+            # locally whether it's passphrase-protected like it does for
+            # local keys — ask the server itself (single quick ssh-keygen
+            # check, same pattern as _check_ssh_alive above). If it is, ask
+            # for the passphrase now so it's cached before we go async; the
+            # worker unlocks the key into an ssh-agent ON THE SERVER so git
+            # can authenticate through it non-interactively (BatchMode=yes
+            # can never prompt for a passphrase, which is why this used to
+            # just fail silently with a publickey auth error).
+            cache_key = f"{ssh.host}:{server_key}"
+            if cache_key in self._server_key_passphrases:
+                server_passphrase = self._server_key_passphrases[cache_key]
+            else:
+                try:
+                    needs = AddonsManager(ssh).server_key_needs_passphrase(server_key)
+                except Exception:
+                    needs = False
+                if needs:
+                    server_passphrase = simpledialog.askstring(
+                        "Passphrase de llave SSH",
+                        f"La llave del servidor requiere passphrase:\n{server_key}\n\n"
+                        "Se usara para desbloquearla en un ssh-agent en el servidor "
+                        "(la llave nunca sale del servidor).",
+                        show="*",
+                        parent=self.root,
+                    )
+                    if server_passphrase is None:
+                        return  # cancelled
+                    self._server_key_passphrases[cache_key] = server_passphrase
 
         elif key_source == "local":
             local_key = self._v_a_ssh_key.get().strip()
@@ -4885,14 +5096,21 @@ class BackupApp:
             )
             return
 
-        try:
-            ssh = self._get_addons_ssh()
-        except RuntimeError as exc:
-            messagebox.showwarning(APP_TITLE, str(exc))
-            return
-
-        if not self._check_ssh_alive(ssh, "addons"):
-            return
+        # Modo espejo forzado descarta cambios locales en el servidor de forma
+        # irreversible (git reset --hard + git clean -fd) — requiere confirmacion
+        # explicita cada vez, igual que otras acciones destructivas de la app.
+        if self._v_a_force_mirror.get():
+            answer = messagebox.askyesno(
+                APP_TITLE,
+                f"MODO ESPEJO FORZADO activado para:\n\n  {target}\n\n"
+                "Esto va a DESCARTAR cualquier cambio local en esa ruta del servidor "
+                "(archivos modificados o no rastreados) y dejarla identica a la rama "
+                f"'{branch}' del repositorio remoto.\n\n"
+                "Esta accion no se puede deshacer. ¿Continuar?",
+                icon="warning",
+            )
+            if not answer:
+                return
 
         self._btn_sync_addons.config(state="disabled")
         self._v_a_progress.set(0)
@@ -4908,7 +5126,9 @@ class BackupApp:
             "server_key":     server_key,      # remote path  (server mode)
             "local_key":      local_key,       # local path   (local mode)
             "passphrase":     passphrase,      # local passphrase (local mode)
+            "server_passphrase": server_passphrase,  # server key passphrase (server mode)
             "use_submodules": self._v_a_submodules.get(),
+            "force_mirror":   self._v_a_force_mirror.get(),
             "restart":        self._v_a_restart.get(),
             "service":        self._v_a_service.get().strip(),
         }
@@ -4929,6 +5149,8 @@ class BackupApp:
         # Track whether we uploaded a key file (True) or only wrote a wrapper (False)
         key_uploaded = False
         wrapper_written = False
+        agent_started = False
+        env_prefix = ""
 
         try:
             # Step 1: verify git on the server
@@ -4942,6 +5164,17 @@ class BackupApp:
                     p["server_key"], log_callback=self._log
                 )
                 wrapper_written = True
+                # If the key is passphrase-protected, _action_sync_addons
+                # already collected the passphrase — unlock it into an
+                # ssh-agent on the server so BatchMode=yes git can
+                # authenticate through the agent instead of needing to
+                # read the (still encrypted) key file directly.
+                if p.get("server_passphrase"):
+                    self._q.put(("addons_progress", (25, "Desbloqueando llave del servidor...")))
+                    env_prefix = mgr.unlock_server_key(
+                        p["server_key"], p["server_passphrase"], log_callback=self._log,
+                    )
+                    agent_started = True
 
             elif p["key_source"] == "local":
                 self._q.put(("addons_progress", (20, "Subiendo llave SSH temporal...")))
@@ -4966,7 +5199,9 @@ class BackupApp:
                 target_path=p["target"],
                 odoo_user=p["odoo_user"],
                 use_submodules=p["use_submodules"],
+                force_mirror=p["force_mirror"],
                 log_callback=self._log,
+                env_prefix=env_prefix,
                 cancel_event=self._cancel_event,
             )
             self._q.put(("addons_progress", (80, "Repositorio sincronizado.")))
@@ -4993,6 +5228,8 @@ class BackupApp:
             # Remove temp files — only delete the key file if we uploaded one
             if wrapper_written:
                 mgr.cleanup_key(uploaded=key_uploaded)
+            if agent_started:
+                mgr.stop_agent()
 
     def _action_detect_service(self) -> None:
         """Auto-detect the Odoo systemd service name on the selected server."""
@@ -5576,44 +5813,128 @@ class BackupApp:
 
     def _on_close(self) -> None:
         """
-        Confirm close if a backup is running, then clean up SSH.
+        Confirm close if a backup is genuinely active, then clean up SSH.
+
+        "Active" vs "frozen": a manual backup (Tab 5) or a scheduled rule
+        (Tab automatizacion) can be marked as running while actually being
+        stuck — e.g. a stalled network read that hasn't yet hit the socket
+        inactivity timeout in ssh_client.py. Interrupting a HEALTHY transfer
+        deserves a confirmation (nohup keeps the remote side going, but the
+        user should know); interrupting one that's already dead in the water
+        does not — there is nothing real left to lose, so closing proceeds
+        without asking. The distinguishing signal is recency of queue
+        activity (self._last_activity_ts, refreshed on every log/progress
+        event in _poll_queue): if nothing has been reported in over
+        _FROZEN_ACTIVITY_THRESHOLD_SECS, treat it as frozen.
 
         Because long commands run via nohup on the server, they survive
         the SSH disconnect — the user can safely close and the operation
-        continues. We still warn so they don't assume it was cancelled.
+        continues. We still warn (when active) so they don't assume it was
+        cancelled.
+
+        The active/frozen check and (if active) the confirmation dialog run
+        before any window feedback appears, and afterwards closing every SSH
+        connection is bounded but can still take a few seconds — from the
+        user's point of view that's a silent gap after clicking the X where
+        the window doesn't visibly react, easy to mistake for the app having
+        missed the click or frozen. A small always-shown status window
+        ("Validando tareas pendientes...") is opened first and forced to
+        paint immediately, before any of that work runs, purely as feedback
+        that the click registered — it carries no decision of its own.
         """
-        btn_state = str(self._btn_run.cget("state"))
-        if btn_state == "disabled":
-            # Backup in progress — confirm before closing
-            answer = messagebox.askyesno(
-                APP_TITLE,
-                "Hay un backup en ejecucion.\n\n"
-                "Los procesos en el servidor (pg_dump / zip) continuaran "
-                "corriendo aunque cierres esta ventana, porque se lanzaron "
-                "con nohup.\n\n"
-                "Puedes reconectarte mas tarde para descargar los archivos "
-                "de /tmp/ cuando terminen.\n\n"
-                "Cerrar de todos modos?",
-            )
-            if not answer:
-                return
+        status = tk.Toplevel(self.root)
+        status.title(APP_TITLE)
+        status.resizable(False, False)
+        status.transient(self.root)
+        tk.Label(
+            status,
+            text="Validando tareas pendientes...",
+            padx=24,
+            pady=16,
+        ).pack()
+        status.update_idletasks()
+        w, h = status.winfo_reqwidth(), status.winfo_reqheight()
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        status.geometry(f"{w}x{h}+{x}+{y}")
+        status.update()
+
+        manual_running = str(self._btn_run.cget("state")) == "disabled"
+        scheduled_running = self._scheduler.has_active_jobs()
+
+        if manual_running or scheduled_running:
+            idle_secs = time.monotonic() - self._last_activity_ts
+            is_frozen = idle_secs > _FROZEN_ACTIVITY_THRESHOLD_SECS
+
+            if not is_frozen:
+                parts = []
+                if manual_running:
+                    parts.append("un backup manual (Tab 5)")
+                if scheduled_running:
+                    parts.append("una regla programada (Automatizacion)")
+                running_desc = " y ".join(parts)
+                status.withdraw()  # hide behind the modal confirm dialog
+                answer = messagebox.askyesno(
+                    APP_TITLE,
+                    f"Hay {running_desc} en ejecucion activa.\n\n"
+                    "Los procesos en el servidor (pg_dump / tar) continuaran "
+                    "corriendo aunque cierres esta ventana, porque se lanzaron "
+                    "con nohup.\n\n"
+                    "Puedes reconectarte mas tarde para descargar los archivos "
+                    "de /tmp/ cuando terminen.\n\n"
+                    "Cerrar de todos modos?",
+                )
+                if not answer:
+                    status.destroy()
+                    return
+                status.deiconify()
+            # else: marked as running but no progress in a while — treat as
+            # frozen/stuck and close without prompting, no confirmation needed.
+
+        status.title(APP_TITLE)
+        for child in status.winfo_children():
+            child.configure(text="Validando procesos antes de cerrar...")
+        status.update()
 
         self._save_geometry()
-        # Cerrar terminales PTY antes de cerrar conexiones SSH
-        for term in (
+
+        # Close every connection in parallel (each internally bounded to a
+        # few seconds — see SSHClient.close() / SshTerminalPanel.disconnect())
+        # so a single stuck connection can't make closing the app take
+        # 3-4x as long by waiting on them one at a time.
+        closers = [
             getattr(self, "_term_l", None),
             getattr(self, "_term_r", None),
-        ):
-            if term is not None:
-                term.disconnect()
-        self._ssh.close()
-        self._ssh_restore.close()
-        self._ssh_dest.close()
+            self._ssh,
+            self._ssh_restore,
+            self._ssh_dest,
+        ]
+
+        def _close_one(obj) -> None:
+            try:
+                if hasattr(obj, "disconnect"):
+                    obj.disconnect()
+                else:
+                    obj.close()
+            except Exception:
+                pass
+
+        threads = []
+        for obj in closers:
+            if obj is None:
+                continue
+            t = threading.Thread(target=_close_one, args=(obj,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=6)
+
         # Stop the background scheduler daemon before destroying the window
         try:
             self._scheduler.stop()
         except Exception:
             pass
+        status.destroy()
         self.root.destroy()
 
     # ── Tab 11: Automatización ────────────────────────────────────────────
@@ -5836,12 +6157,15 @@ class BackupApp:
             "Se ejecutara en segundo plano. El resultado aparecera en el log.",
         ):
             return
-        # Run in a fresh thread via the scheduler's _run_rule logic
-        t = threading.Thread(
-            target=self._scheduler._run_rule,
-            args=(rule,),
-            name=f"sched-manual-{rule_id[:8]}",
-            daemon=True,
-        )
-        t.start()
+        # Delegate to the scheduler's own guarded entry point — run_rule_now()
+        # checks the same _active_jobs lock _tick() uses, so this can never
+        # collide with an automatic run of the same rule firing at the same
+        # moment (both used to be able to run _run_rule concurrently for the
+        # same rule_id, racing on the same /tmp remote file paths).
+        if not self._scheduler.run_rule_now(rule):
+            messagebox.showinfo(
+                APP_TITLE,
+                f'El backup "{label}" ya se esta ejecutando — espere a que termine.',
+            )
+            return
         self._sched_append_log(f"[{label}] Ejecucion manual iniciada...")

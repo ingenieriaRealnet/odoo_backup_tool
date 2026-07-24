@@ -124,8 +124,8 @@ class FilestoreManager:
         return code == 0
 
     def default_zip_path(self, db_name: str) -> str:
-        """Return the default /tmp/ path for a filestore zip."""
-        return f"/tmp/filestore_{db_name}.zip"
+        """Return the default /tmp/ path for a filestore archive (.tar)."""
+        return f"/tmp/filestore_{db_name}.tar"
 
     def compress_filestore(
         self,
@@ -136,24 +136,34 @@ class FilestoreManager:
         cancel_event=None,
     ) -> str:
         """
-        Compress a database's filestore folder into a zip file in /tmp/.
+        Archive a database's filestore folder into an uncompressed .tar in /tmp/.
+
+        Uses plain 'tar' instead of 'zip': filestore attachments (PDFs, images)
+        are already compressed, so zip's compression pass only burned 5-12 min
+        of CPU per client for <15% size reduction (confirmed in the 2026-07-15
+        log analysis) without any transfer-time benefit. tar -cf skips that pass
+        entirely, matching the same no-recompression rationale already used for
+        the outer backup bundle (see bundle_manager.py).
 
         Args:
             filestore_root: Root filestore path on the server.
             db_name: Name of the DB subfolder to compress.
-            remote_zip: Override the output zip path (used when the caller
+            remote_zip: Override the output archive path (used when the caller
                         resolved a name conflict before calling this method).
+                        May end in .tar (new backups) or .zip (kept only for
+                        callers that still explicitly request the old format).
             log_callback: Optional function for progress messages.
 
         Returns:
-            Absolute path of the zip file on the remote server.
+            Absolute path of the archive file on the remote server.
 
         Raises:
-            RuntimeError: If the source folder is missing or zip fails.
+            RuntimeError: If the source folder is missing or the archive command fails.
         """
         source_path = f"{filestore_root}/{db_name}"
         if remote_zip is None:
-            remote_zip = f"/tmp/filestore_{db_name}.zip"
+            remote_zip = f"/tmp/filestore_{db_name}.tar"
+        use_zip = remote_zip.lower().endswith(".zip")
 
         # Verify source directory exists
         code, _, _ = self._ssh.execute(f"test -d {source_path}")
@@ -193,36 +203,58 @@ class FilestoreManager:
                     )
 
         if log_callback:
-            log_callback(f"Comprimiendo filestore '{db_name}' ...")
-
-        # Ensure zip is available (Debian/Ubuntu and RHEL/CentOS paths)
-        self._ssh.execute(
-            "which zip >/dev/null 2>&1 || "
-            "(apt-get install -y zip 2>/dev/null || yum install -y zip 2>/dev/null)"
-        )
+            verb = "Comprimiendo" if use_zip else "Empaquetando"
+            log_callback(f"{verb} filestore '{db_name}' ...")
 
         def _heartbeat(status: str) -> None:
             if log_callback:
-                log_callback(f"  [zip en curso] {status}")
+                log_callback(f"  [{'zip' if use_zip else 'tar'} en curso] {status}")
 
-        # nice -n 19: lowest CPU priority.
-        # -1 compression level: fastest, minimal CPU — filestore files are
-        # mostly already-compressed attachments (PDFs, images), so heavy
-        # compression wastes CPU without significant size reduction.
-        #
-        # cd to filestore_root before zipping so the archive stores only the
+        # cd to filestore_root before archiving so the archive stores only the
         # relative path "{db_name}/00/..." instead of the full absolute path.
         # Without this, extraction reproduces the entire directory tree inside
         # the staging folder and the content ends up at the wrong nested path.
+        if use_zip:
+            # Legacy path — kept only for callers that explicitly request .zip.
+            # Ensure zip is available (Debian/Ubuntu and RHEL/CentOS paths)
+            self._ssh.execute(
+                "which zip >/dev/null 2>&1 || "
+                "(apt-get install -y zip 2>/dev/null || yum install -y zip 2>/dev/null)"
+            )
+            # nice -n 19: lowest CPU priority.
+            # -1 compression level: fastest, minimal CPU — filestore files are
+            # mostly already-compressed attachments (PDFs, images), so heavy
+            # compression wastes CPU without significant size reduction.
+            cmd = f"cd {filestore_root} && nice -n 19 zip -1 -r {remote_zip} {db_name}"
+        else:
+            # Default path: plain tar, no compression pass at all — the
+            # filestore is already-compressed attachments, so zip's CPU cost
+            # bought <15% size reduction for nothing (2026-07-15 log analysis).
+            #
+            # GNU tar exit codes: 0 = clean, 1 = some files differed (e.g. a
+            # file was modified while being read — expected on a live Odoo
+            # filestore that keeps receiving uploads during business hours),
+            # 2 = fatal error. Confirmed in the 2026-07-17 log: backup_equiredes
+            # aborted entirely on "file changed as we read it", which is only
+            # a warning, not a reason to lose the whole backup. `; test $? -le 1`
+            # folds tar's own exit code 0-or-1 into a clean 0 for execute_long's
+            # success/failure gate, while still failing hard on real errors
+            # (exit 2+, or `cd` itself failing).
+            cmd = (
+                f"cd {filestore_root} && "
+                f"(nice -n 19 tar -cf {remote_zip} {db_name}; test $? -le 1)"
+            )
+
         code, _, err = self._ssh.execute_long(
-            f"cd {filestore_root} && nice -n 19 zip -1 -r {remote_zip} {db_name}",
-            watch_cmd=f"ls -lh {remote_zip} 2>/dev/null || echo 'comprimiendo...'",
+            cmd,
+            watch_cmd=f"ls -lh {remote_zip} 2>/dev/null || echo 'empaquetando...'",
             heartbeat_callback=_heartbeat,
             timeout=3600,
             cancel_event=cancel_event,
         )
         if code != 0:
-            raise RuntimeError(f"zip fallo para '{db_name}':\n{err}")
+            tool = "zip" if use_zip else "tar"
+            raise RuntimeError(f"{tool} fallo para '{db_name}':\n{err}")
 
         _, size_out, _ = self._ssh.execute(f"ls -lh {remote_zip}")
         if log_callback:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +36,11 @@ class ProfileManager:
     """
 
     def __init__(self) -> None:
+        # Thread-safe: this instance is shared between the GUI (Tab 1/6 profile
+        # widgets, mutated on the Tk main thread) and BackupScheduler, which
+        # reads it from its own background job threads on every scheduled run.
+        # Mirrors the lock already used by ScheduleManager for schedules.json.
+        self._lock = threading.Lock()
         self._profiles: list[dict] = []
         self._load()
 
@@ -52,16 +58,28 @@ class ProfileManager:
                 self._profiles = []
 
     def _save(self) -> None:
-        """Persist the current profile list to disk."""
+        """
+        Persist the current profile list to disk. Must be called with
+        self._lock held.
+
+        Writes to a temp file then os.replace()'s it into place — an
+        interrupted or interleaved write can never leave servers.json
+        truncated/torn (which _load() would otherwise silently treat as
+        corrupt and reset to an empty profile list, losing every saved
+        server profile).
+        """
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(_PROFILE_FILE, "w", encoding="utf-8") as fh:
+        tmp_path = _PROFILE_FILE.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump({"servers": self._profiles}, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, _PROFILE_FILE)
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def names(self) -> list[str]:
         """Return the list of profile names in storage order."""
-        return [p["name"] for p in self._profiles]
+        with self._lock:
+            return [p["name"] for p in self._profiles]
 
     def get(self, name: str) -> Optional[dict]:
         """
@@ -72,13 +90,14 @@ class ProfileManager:
                             gdrive_creds_path, gdrive_folder_id
             (gdrive fields default to "" for profiles saved before v1.2)
         """
-        for p in self._profiles:
-            if p["name"] == name:
-                result = dict(p)
-                # Back-fill Drive fields for older profiles that lack them
-                result.setdefault("gdrive_creds_path", "")
-                result.setdefault("gdrive_folder_id", "")
-                return result
+        with self._lock:
+            for p in self._profiles:
+                if p["name"] == name:
+                    result = dict(p)
+                    # Back-fill Drive fields for older profiles that lack them
+                    result.setdefault("gdrive_creds_path", "")
+                    result.setdefault("gdrive_folder_id", "")
+                    return result
         return None
 
     def save(
@@ -125,15 +144,15 @@ class ProfileManager:
             "gdrive_folder_id":   gdrive_folder_id.strip(),
         }
 
-        # Replace existing entry with same name, or append
-        for i, p in enumerate(self._profiles):
-            if p["name"] == name:
-                self._profiles[i] = entry
-                self._save()
-                return
-
-        self._profiles.append(entry)
-        self._save()
+        with self._lock:
+            # Replace existing entry with same name, or append
+            for i, p in enumerate(self._profiles):
+                if p["name"] == name:
+                    self._profiles[i] = entry
+                    self._save()
+                    return
+            self._profiles.append(entry)
+            self._save()
 
     def delete(self, name: str) -> bool:
         """
@@ -142,9 +161,10 @@ class ProfileManager:
         Returns:
             True if a profile was removed, False if it did not exist.
         """
-        before = len(self._profiles)
-        self._profiles = [p for p in self._profiles if p["name"] != name]
-        if len(self._profiles) < before:
-            self._save()
-            return True
-        return False
+        with self._lock:
+            before = len(self._profiles)
+            self._profiles = [p for p in self._profiles if p["name"] != name]
+            if len(self._profiles) < before:
+                self._save()
+                return True
+            return False

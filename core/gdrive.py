@@ -23,6 +23,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
+import ssl
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +33,9 @@ from typing import Callable
 
 # ── Optional dependency guard ─────────────────────────────────────────────────
 try:
+    import httplib2
     from google.oauth2.service_account import Credentials
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
@@ -38,17 +43,85 @@ try:
 except ImportError:
     _GOOGLE_LIBS_OK = False
 
+# Network-level errors that mean "this socket call went quiet/broke", worth
+# retrying exactly like a transient HTTP 5xx. Discovered in the 2026-07-16
+# stress test log: backup_novalens sat at 86% with zero progress for ~35 min
+# before finally raising [SSL: WRONG_VERSION_NUMBER] — the stall itself went
+# undetected the whole time because no socket-level inactivity timeout was
+# ever configured, so a dead connection just hung instead of failing fast.
+_NETWORK_RETRYABLE = (
+    socket.timeout, TimeoutError, ConnectionError, ssl.SSLError,
+    # Broad OSError catch-all: needed because _StallWatchdog's forced
+    # disconnect (closing the socket out from under a blocked recv/send in
+    # another thread) doesn't reliably surface as one of the narrower types
+    # above — on Windows it typically raises a bare OSError (WinError 10038,
+    # "not a socket") once the handle is invalidated mid-call. Since every
+    # use of _with_retry wraps a Drive network call, treating any OSError as
+    # retryable here is safe and specifically covers our own injected fault.
+    OSError,
+)
+
+# Per-socket-call inactivity timeout: if Drive stops sending/receiving bytes
+# for this long, the underlying socket read/write raises instead of hanging
+# indefinitely. This is a per-call timeout (applies to each recv/send), not a
+# total-upload timeout — a healthy slow upload still finishes fine, only a
+# truly stalled connection trips it.
+_STALL_TIMEOUT_SECS = 120
+
+# Ceiling on wall-clock time with ZERO completed chunks before the upload is
+# forced to fail and retry on a fresh connection. Confirmed necessary by two
+# 2026-07-17 incidents where a chunked upload sat "alive" — the socket kept
+# trickling just enough bytes to keep resetting _STALL_TIMEOUT_SECS — for
+# 30-44 minutes with no real progress, before finally surfacing an unrelated,
+# confusing error (HttpError 200 "OK"; a malformed redirect missing its
+# Location header). The per-socket-call timeout above only catches a
+# connection that goes fully silent; it does not catch one that "breathes"
+# without advancing. See _StallWatchdog.
+#
+# 600s (was 240s until 2026-07-21): the watchdog can only measure "chunk
+# completed", not real partial-byte progress, so it implicitly demands a
+# throughput floor of _CHUNK_SIZE / _MAX_STALL_SECS to avoid firing. At
+# 240s/16MB that floor was ~68 KB/s — on 2026-07-21 the office uplink ran
+# below that most of the day, and the watchdog killed EVERY scheduled
+# backup's upload (0/5 completed), where before this watchdog existed the
+# same slow-but-working link just finished, late but intact. 600s (with the
+# smaller chunk below) restores headroom for a genuinely slow-but-alive
+# connection while still catching the 30-44 min real stalls that motivated
+# this watchdog in the first place.
+_MAX_STALL_SECS = 600
+
 _DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
-# 16 MB per chunk — 64 × 256 KB (Google minimum multiple), optimal for large files.
-# Larger chunks reduce HTTP round-trips; smaller chunks waste more bandwidth on retry.
-_CHUNK_SIZE = 16 * 1024 * 1024
+# 4 MB per chunk (was 16 MB until 2026-07-21): smaller chunks complete more
+# often under low bandwidth, giving _StallWatchdog more frequent touch()
+# checkpoints — combined with the 600s ceiling above, this raises the
+# effective throughput floor before a false "stalled" kill from ~68 KB/s to
+# ~7 KB/s. It also means less confirmed progress is lost per retry when a
+# chunk genuinely does fail. The extra HTTP round-trips this costs are
+# negligible next to transfer time on a bandwidth-constrained link.
+_CHUNK_SIZE = 4 * 1024 * 1024
 
 # Directory for cross-session resumable-upload checkpoint files (upload_file only).
 _CHECKPOINT_DIR = Path.home() / ".odoo_backup_tool" / "upload_checkpoints"
 
 # HTTP status codes that indicate a transient error worth retrying.
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# 200/201 landing in the HttpError branch (instead of a normal return) is a
+# known googleapiclient quirk: the resumable session actually accepted the
+# chunk, but the response body couldn't be parsed as the expected JSON —
+# confirmed as the cause of the 2026-07-21 log's "HttpError 200 'OK'"
+# failures on equiredes/novalens, which killed those uploads outright
+# because 200 wasn't in _RETRYABLE_STATUS. The upload already succeeded on
+# Drive's side, so retrying (next_chunk() re-queries the real state) is
+# safe and is the documented workaround for this quirk.
+_RETRYABLE_MALFORMED_STATUS = {200, 201}
+
+# Below this speed, a chunk is considered "slow" for the degraded-speed alert.
+_SLOW_CHUNK_MBPS = 1.0
+# Consecutive slow chunks required before firing the alert (avoids false
+# positives from a single momentary dip).
+_SLOW_CHUNK_STREAK = 5
 
 
 def _require_libs() -> None:
@@ -73,15 +146,158 @@ def _with_retry(fn, *, max_attempts: int = 5, log_callback=None):
         try:
             return fn()
         except HttpError as exc:
-            if exc.resp.status not in _RETRYABLE_STATUS or attempt == max_attempts:
+            status = exc.resp.status
+            retryable = status in _RETRYABLE_STATUS or status in _RETRYABLE_MALFORMED_STATUS
+            if not retryable or attempt == max_attempts:
+                if log_callback and attempt == max_attempts:
+                    log_callback(
+                        f"  [Drive] Error {status} — se agotaron los "
+                        f"{max_attempts} intentos, abortando."
+                    )
+                raise
+            delay = min(2 ** attempt, 60)
+            if log_callback:
+                reason = (
+                    "respuesta incompleta del servidor (el chunk probablemente "
+                    "si se recibio)" if status in _RETRYABLE_MALFORMED_STATUS
+                    else f"Error {status}"
+                )
+                log_callback(
+                    f"  [Drive] {reason} — "
+                    f"reintento {attempt}/{max_attempts - 1} en {delay}s ..."
+                )
+            time.sleep(delay)
+        except _NETWORK_RETRYABLE as exc:
+            # Socket-level stall/break (inactivity timeout, dropped SSL
+            # connection, connection reset). Resumable uploads are designed
+            # to survive exactly this: calling next_chunk() again re-queries
+            # the upload offset from Drive and continues from there instead
+            # of restarting from byte 0.
+            if attempt == max_attempts:
+                if log_callback:
+                    log_callback(
+                        f"  [Drive] {exc.__class__.__name__} persistente — se agotaron "
+                        f"los {max_attempts} intentos, abortando."
+                    )
                 raise
             delay = min(2 ** attempt, 60)
             if log_callback:
                 log_callback(
-                    f"  [Drive] Error {exc.resp.status} — "
+                    f"  [Drive] Conexion interrumpida ({exc.__class__.__name__}: {exc}) — "
                     f"reintento {attempt}/{max_attempts - 1} en {delay}s ..."
                 )
             time.sleep(delay)
+
+
+class _StallWatchdog:
+    """
+    Forces a chunked upload that has made zero real progress for too long to
+    fail fast, instead of hanging indefinitely.
+
+    _STALL_TIMEOUT_SECS (the per-socket-call timeout wired into
+    _get_service) only trips when a connection goes fully silent. It does
+    NOT catch one that keeps trickling just enough bytes to keep resetting
+    that timer without any chunk actually completing — confirmed twice on
+    2026-07-17, where uploads sat "alive" for 30-44 minutes with zero
+    progress before finally surfacing an unrelated, confusing error.
+
+    This watchdog runs in a background thread alongside the upload loop.
+    touch() must be called after every chunk that completes without error.
+    If _MAX_STALL_SECS passes with no touch(), it force-closes the
+    underlying HTTP socket(s) so the blocked next_chunk() call fails
+    immediately with a retryable connection error — _with_retry then
+    resumes the upload from the last confirmed offset on a fresh connection
+    instead of sitting stuck.
+    """
+
+    def __init__(
+        self,
+        http_client,
+        max_stall_secs: int = _MAX_STALL_SECS,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        self._http_client = http_client
+        self._max_stall_secs = max_stall_secs
+        self._log_callback = log_callback
+        self._last_progress = time.monotonic()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def touch(self) -> None:
+        self._last_progress = time.monotonic()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        # Polls every 10s rather than sleeping the full stall window in one
+        # shot, so stop() (called as soon as the upload finishes normally)
+        # takes effect quickly instead of leaving the thread lingering.
+        while not self._stop.wait(timeout=10):
+            if time.monotonic() - self._last_progress > self._max_stall_secs:
+                if self._log_callback:
+                    self._log_callback(
+                        f"  [Drive] Sin progreso real en {self._max_stall_secs}s — "
+                        "forzando reconexion ..."
+                    )
+                self._force_disconnect()
+                # Reset the clock so a slow reconnect/retry cycle doesn't
+                # trigger another forced disconnect before it gets a chance
+                # to make progress.
+                self._last_progress = time.monotonic()
+
+    def _force_disconnect(self) -> None:
+        """Close every open socket httplib2 is holding for this client."""
+        raw_http = getattr(self._http_client, "http", self._http_client)
+        connections = getattr(raw_http, "connections", None)
+        if not connections:
+            return
+        for conn in list(connections.values()):
+            sock = getattr(conn, "sock", None)
+            if sock is None:
+                continue
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class _SpeedWatchdog:
+    """
+    Tracks consecutive slow chunks during an upload and fires a one-time
+    [ALERTA] log line when sustained throttling/contention is detected.
+
+    Does not abort the upload — purely informational, so the user can spot
+    Drive throttling or competing transfers (as happened with 'mega' on
+    2026-07-15) while the upload is still in progress.
+    """
+
+    def __init__(self) -> None:
+        self._streak = 0
+        self._fired  = False
+
+    def check(self, speed_mbps: float, filename: str, log_callback) -> None:
+        if self._fired:
+            return
+        if speed_mbps < _SLOW_CHUNK_MBPS:
+            self._streak += 1
+        else:
+            self._streak = 0
+        if self._streak >= _SLOW_CHUNK_STREAK:
+            self._fired = True
+            if log_callback:
+                log_callback(
+                    f"  [ALERTA] Velocidad degradada subiendo '{filename}': "
+                    f"< {_SLOW_CHUNK_MBPS:.1f} MB/s durante {self._streak} chunks seguidos. "
+                    "Puede haber throttling de Drive o transferencias compitiendo por el canal."
+                )
 
 
 class _HashingReader:
@@ -171,10 +387,20 @@ class DriveUploader:
         return Credentials.from_service_account_info(data, scopes=[_DRIVE_SCOPE])
 
     def _get_service(self):
-        """Return the cached Drive v3 service, building it on first call."""
+        """
+        Return the cached Drive v3 service, building it on first call.
+
+        Wires an explicit per-socket-call timeout (_STALL_TIMEOUT_SECS) via
+        AuthorizedHttp/httplib2 instead of letting build() construct its own
+        default (unbounded) http client. Without this, a socket that stops
+        receiving/sending bytes mid-transfer just hangs forever — that is
+        exactly what happened to backup_novalens in the 2026-07-16 log
+        (stuck at 86% for ~35 minutes before finally raising a raw SSL error).
+        """
         if self._service is None:
             creds = self._load_creds()
-            self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            authorized_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=_STALL_TIMEOUT_SECS))
+            self._service = build("drive", "v3", http=authorized_http, cache_discovery=False)
         return self._service
 
     def _resolve_target_folder(self) -> str:
@@ -252,6 +478,41 @@ class DriveUploader:
         ).execute()
         self._resolved_folder_id = new_folder["id"]
         return self._resolved_folder_id
+
+    def _fetch_uploaded_file_meta(self, svc, folder_id: str, filename: str) -> dict:
+        """
+        Look up a just-uploaded file's id/md5Checksum directly by name+parent.
+
+        Fallback for when request.next_chunk()'s completion response isn't a
+        usable dict — confirmed in the 2026-07-21 log (backup_mega: "'str'
+        object has no attribute 'get'"). The googleapiclient resumable-upload
+        quirk that produces a malformed "HttpError 200 'OK'" (see
+        _RETRYABLE_MALFORMED_STATUS) can, on a slightly different code path,
+        surface as next_chunk() returning the raw response body (a str)
+        instead of the parsed dict — in both cases the file already exists
+        on Drive, so querying for it by name is a safe, cheap recovery
+        instead of crashing the whole upload after it actually succeeded.
+
+        Raises RuntimeError if the file truly isn't there — callers must not
+        treat "nothing found" as success (that would falsely report a failed
+        upload as complete).
+        """
+        result = svc.files().list(
+            q=f"'{folder_id}' in parents and name='{filename}' and trashed=false",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            orderBy="createdTime desc",
+            pageSize=1,
+            fields="files(id,md5Checksum)",
+        ).execute()
+        files = result.get("files", [])
+        if not files:
+            raise RuntimeError(
+                f"La subida de '{filename}' termino con una respuesta no "
+                "interpretable y el archivo tampoco se encontro en Drive por "
+                "nombre — probablemente si fallo. Repita el upload."
+            )
+        return files[0]
 
     # ── Checkpoint helpers (upload_file only) ─────────────────────────────────
 
@@ -435,41 +696,61 @@ class DriveUploader:
         t_start    = time.monotonic()
         t_last     = t_start
         bytes_last = checkpoint["offset"] if checkpoint else 0
+        watchdog   = _SpeedWatchdog()
+        stall_watchdog = _StallWatchdog(svc._http, log_callback=log_callback)
+        stall_watchdog.start()
 
-        while response is None:
-            status, response = _with_retry(
-                request.next_chunk,
-                max_attempts=5,
-                log_callback=log_callback,
-            )
+        try:
+            while response is None:
+                status, response = _with_retry(
+                    request.next_chunk,
+                    max_attempts=5,
+                    log_callback=log_callback,
+                )
+                stall_watchdog.touch()
 
-            if status:
-                uploaded    = int(status.resumable_progress)
-                now         = time.monotonic()
-                chunk_secs  = now - t_last
-                chunk_bytes = uploaded - bytes_last
-                speed_mbps  = (chunk_bytes / chunk_secs / (1024 * 1024)) if chunk_secs > 0 else 0.0
-                elapsed     = now - t_start
-                t_last      = now
-                bytes_last  = uploaded
+                if status:
+                    uploaded    = int(status.resumable_progress)
+                    now         = time.monotonic()
+                    chunk_secs  = now - t_last
+                    chunk_bytes = uploaded - bytes_last
+                    speed_mbps  = (chunk_bytes / chunk_secs / (1024 * 1024)) if chunk_secs > 0 else 0.0
+                    elapsed     = now - t_start
+                    t_last      = now
+                    bytes_last  = uploaded
+                    watchdog.check(speed_mbps, filename, log_callback)
 
-                if progress_callback:
-                    progress_callback(uploaded, total_size)
+                    if progress_callback:
+                        progress_callback(uploaded, total_size)
 
-                pct = int(uploaded / total_size * 100) if total_size else 0
-                if pct != last_pct:
-                    last_pct = pct
-                    eta_str  = _eta(total_size, uploaded, elapsed)
-                    if log_callback:
-                        log_callback(
-                            f"  Subiendo a Drive ... {pct}%  "
-                            f"({speed_mbps:.1f} MB/s — ETA {eta_str})"
-                        )
+                    pct = int(uploaded / total_size * 100) if total_size else 0
+                    if pct != last_pct:
+                        last_pct = pct
+                        eta_str  = _eta(total_size, uploaded, elapsed)
+                        if log_callback:
+                            log_callback(
+                                f"  Subiendo a Drive ... {pct}%  "
+                                f"({speed_mbps:.1f} MB/s — ETA {eta_str})"
+                            )
 
-                # Persist checkpoint so a crash can resume from here.
-                uri = getattr(request, "_resumable_uri", None)
-                if uri:
-                    self._save_checkpoint(filename, uri, uploaded, total_size)
+                    # Persist checkpoint so a crash can resume from here.
+                    uri = getattr(request, "_resumable_uri", None)
+                    if uri:
+                        self._save_checkpoint(filename, uri, uploaded, total_size)
+        finally:
+            stall_watchdog.stop()
+
+        if not isinstance(response, dict):
+            # Upload actually finished on Drive's side (we got a completion
+            # response at all) but the client couldn't parse it into the
+            # expected dict — recover by looking the file up by name instead
+            # of crashing on response.get(...). See _fetch_uploaded_file_meta.
+            if log_callback:
+                log_callback(
+                    "  [Drive] Respuesta de finalizacion no interpretable — "
+                    "verificando el archivo subido por nombre ..."
+                )
+            response = self._fetch_uploaded_file_meta(svc, folder_id, filename)
 
         # ── MD5 integrity check ───────────────────────────────────────────────
         file_id   = response.get("id", "")
@@ -652,36 +933,54 @@ class DriveUploader:
         t_start    = time.monotonic()
         t_last     = t_start
         bytes_last = 0
+        watchdog   = _SpeedWatchdog()
+        stall_watchdog = _StallWatchdog(svc._http, log_callback=log_callback)
+        stall_watchdog.start()
 
-        while response is None:
-            status, response = _with_retry(
-                request.next_chunk,
-                max_attempts=5,
-                log_callback=log_callback,
-            )
+        try:
+            while response is None:
+                status, response = _with_retry(
+                    request.next_chunk,
+                    max_attempts=5,
+                    log_callback=log_callback,
+                )
+                stall_watchdog.touch()
 
-            if status and total_size:
-                uploaded    = int(status.resumable_progress)
-                now         = time.monotonic()
-                chunk_secs  = now - t_last
-                chunk_bytes = uploaded - bytes_last
-                speed_mbps  = (chunk_bytes / chunk_secs / (1024 * 1024)) if chunk_secs > 0 else 0.0
-                elapsed     = now - t_start
-                t_last      = now
-                bytes_last  = uploaded
+                if status and total_size:
+                    uploaded    = int(status.resumable_progress)
+                    now         = time.monotonic()
+                    chunk_secs  = now - t_last
+                    chunk_bytes = uploaded - bytes_last
+                    speed_mbps  = (chunk_bytes / chunk_secs / (1024 * 1024)) if chunk_secs > 0 else 0.0
+                    elapsed     = now - t_start
+                    t_last      = now
+                    bytes_last  = uploaded
+                    watchdog.check(speed_mbps, filename, log_callback)
 
-                if progress_callback:
-                    progress_callback(uploaded, total_size)
+                    if progress_callback:
+                        progress_callback(uploaded, total_size)
 
-                pct = int(uploaded / total_size * 100)
-                if pct != last_pct:
-                    last_pct = pct
-                    eta_str  = _eta(total_size, uploaded, elapsed)
-                    if log_callback:
-                        log_callback(
-                            f"  Drive streaming ... {pct}%  "
-                            f"({speed_mbps:.1f} MB/s — ETA {eta_str})"
-                        )
+                    pct = int(uploaded / total_size * 100)
+                    if pct != last_pct:
+                        last_pct = pct
+                        eta_str  = _eta(total_size, uploaded, elapsed)
+                        if log_callback:
+                            log_callback(
+                                f"  Drive streaming ... {pct}%  "
+                                f"({speed_mbps:.1f} MB/s — ETA {eta_str})"
+                            )
+        finally:
+            stall_watchdog.stop()
+
+        if not isinstance(response, dict):
+            # See _fetch_uploaded_file_meta — the upload finished on Drive's
+            # side but the completion response wasn't a usable dict.
+            if log_callback:
+                log_callback(
+                    "  [Drive] Respuesta de finalizacion no interpretable — "
+                    "verificando el archivo subido por nombre ..."
+                )
+            response = self._fetch_uploaded_file_meta(svc, folder_id, filename)
 
         # ── MD5 integrity check ───────────────────────────────────────────────
         file_id   = response.get("id", "")
