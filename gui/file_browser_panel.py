@@ -27,6 +27,17 @@ from core.file_browser import RemoteBrowser
 from core.ssh_client import SSHClient
 from gui import icons as _icons
 
+# Drag-and-drop from the OS file manager (Tab 8) — optional at import time so
+# the panel still works in a dev environment that hasn't installed it yet;
+# drop_target_register() below is itself wrapped in try/except for the same
+# reason. See requirements.txt / build.bat|.sh for the packaging side.
+try:
+    from tkinterdnd2 import DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    DND_FILES = None
+    _DND_AVAILABLE = False
+
 # ── Paleta (coincide con app.py) ─────────────────────────────────────────────
 _C_BG      = "#F5F3F0"
 _C_PURPLE  = "#714B67"
@@ -223,6 +234,17 @@ class FileBrowserPanel(ttk.Frame):
             lambda ev: self._tree.yview_scroll(-1 * (ev.delta // 120), "units"),
         ))
         self._tree.bind("<Leave>", lambda e: self._tree.unbind_all("<MouseWheel>"))
+
+        # Drag-and-drop: dropping files/folders from the OS file manager
+        # uploads them to the current remote directory (with confirmation —
+        # see _on_drop_files). No-op if tkinterdnd2 isn't available/the root
+        # window wasn't created via TkinterDnD.Tk() (see main.py).
+        if _DND_AVAILABLE:
+            try:
+                self._tree.drop_target_register(DND_FILES)
+                self._tree.dnd_bind("<<Drop>>", self._on_drop_files)
+            except Exception:
+                pass
 
         self._update_nav_buttons()
 
@@ -798,6 +820,72 @@ class FileBrowserPanel(ttk.Frame):
                 self.after(0, _done)
 
             threading.Thread(target=_dl_multi, daemon=True).start()
+
+    # ── Drag-and-drop upload ───────────────────────────────────────────────────
+
+    def _on_drop_files(self, event) -> None:
+        """
+        Handle files/folders dropped from the OS file manager onto this panel.
+
+        Always confirms before uploading — this touches the remote server,
+        same as every other destructive/transfer action in the app. Files
+        upload directly; folders upload recursively via RemoteBrowser.upload_dir
+        (zip locally → upload → extract remotely).
+        """
+        if not self._browser:
+            messagebox.showwarning(
+                "Arrastrar y soltar",
+                "Conectese al servidor antes de subir archivos.",
+                parent=self,
+            )
+            return
+
+        # tkinterdnd2 gives a Tcl list string; braces wrap paths with spaces.
+        paths = [p for p in self._tree.tk.splitlist(event.data) if os.path.exists(p)]
+        if not paths:
+            return
+
+        names = "\n".join(f"  • {os.path.basename(p)}" for p in paths)
+        if not messagebox.askyesno(
+            "Confirmar subida",
+            f"¿Subir {len(paths)} elemento(s) a '{self._current_path}'?\n\n{names}",
+            parent=self,
+        ):
+            return
+
+        dest_dir = self._current_path
+        self._set_status(f"Subiendo {len(paths)} elemento(s) ...")
+
+        def _upload(ps=paths, dd=dest_dir):
+            errors: list[str] = []
+            done = 0
+            for p in ps:
+                try:
+                    if os.path.isdir(p):
+                        self._browser.upload_dir(p, dd)
+                    else:
+                        remote_target = f"{dd.rstrip('/')}/{os.path.basename(p)}"
+                        self._browser.upload_file(p, remote_target)
+                    done += 1
+                    self.after(0, lambda d=done, t=len(ps): self._set_status(
+                        f"Subiendo ... {d}/{t}"
+                    ))
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(p)}: {exc}")
+
+            def _done(d=done, errs=errors):
+                self._refresh()
+                if errs:
+                    messagebox.showerror(
+                        "Errores al subir", "\n".join(errs), parent=self
+                    )
+                    self._set_status(f"Subida con errores ({d}/{len(ps)})")
+                else:
+                    self._set_status(f"{d} elemento(s) subido(s) a {dd}")
+
+            self.after(0, _done)
+
+        threading.Thread(target=_upload, daemon=True).start()
 
     # ── Cross-panel transfer ──────────────────────────────────────────────────
 

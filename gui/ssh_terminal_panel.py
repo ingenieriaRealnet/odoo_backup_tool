@@ -77,14 +77,21 @@ class SshTerminalPanel(ttk.Frame):
         get_ssh: Callable,
         title: str = "",
         on_status: Callable[[str], None] | None = None,
+        on_session_end: Callable[[str, str, list[str]], None] | None = None,
     ) -> None:
         super().__init__(parent, style="TFrame")
         self._get_ssh    = get_ssh
         self._title      = title
         self._on_status  = on_status or (lambda m: None)
+        # Called when a connected session ends (disconnect, reconnect, or app
+        # close) with (host, panel_title, commands_run) so the caller can log
+        # it to the persistent history — see gui/app.py's HistoryManager
+        # wiring. Never called if the session never actually connected.
+        self._on_session_end = on_session_end
 
         self._channel    = None           # paramiko.Channel
         self._connected  = False
+        self._session_host = ""
         self._q: queue.Queue[str] = queue.Queue()
 
         self.columnconfigure(0, weight=1)
@@ -255,6 +262,12 @@ class SshTerminalPanel(ttk.Frame):
                 channel.settimeout(0.0)   # recv no bloqueante
                 self._channel   = channel
                 self._connected = True
+                self._session_host = f"{ssh.host}:{ssh.port}"
+                # Reset per-session so the eventual on_session_end() summary
+                # reflects only commands run in THIS session, not ones carried
+                # over from a previous connection in the same panel lifetime.
+                self._cmd_history = []
+                self._history_idx = -1
                 self.after(0, lambda: self._append_local(
                     f"Conectado a {ssh.host}  (Ctrl+C para interrumpir un proceso)\n",
                     "ok",
@@ -286,6 +299,7 @@ class SshTerminalPanel(ttk.Frame):
         colgado, y este metodo se llama de forma sincrona desde el cierre
         de la app (Tk main thread) — igual que SSHClient.close().
         """
+        was_connected = self._connected
         self._connected = False
         if self._channel:
             channel = self._channel
@@ -294,6 +308,12 @@ class SshTerminalPanel(ttk.Frame):
             t.start()
             t.join(timeout=5)
         self._append_local("\n[Sesion cerrada]\n", "info")
+
+        # Log a summary of this session to the persistent history — only
+        # when there was actually a session to log (avoids a spurious empty
+        # entry from a stray disconnect() call with nothing connected).
+        if was_connected and self._on_session_end:
+            self._on_session_end(self._session_host, self._title, list(self._cmd_history))
 
     @staticmethod
     def _safe_close_channel(channel) -> None:

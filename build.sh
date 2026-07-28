@@ -58,6 +58,7 @@ pyinstaller \
     --hidden-import plyer.platforms \
     --hidden-import plyer.platforms.linux \
     --hidden-import plyer.platforms.linux.notification \
+    --collect-all tkinterdnd2 \
     --add-data "icon.ico:." \
     main.py
 PYI_EXITCODE=$?

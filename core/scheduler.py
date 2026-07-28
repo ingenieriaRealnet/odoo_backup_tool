@@ -22,6 +22,7 @@ import logging
 import os
 import queue
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -223,6 +224,7 @@ class BackupScheduler:
         poll_interval: int = 60,
         burst_stagger_secs: int = 120,
         temp_registry=None,
+        history=None,
     ) -> None:
         self._sched   = schedule_mgr
         self._profiles = profile_mgr
@@ -236,6 +238,12 @@ class BackupScheduler:
         # entries). Falls back to a private instance for standalone/test use.
         from .temp_registry import RemoteTempRegistry
         self._temp_registry = temp_registry or RemoteTempRegistry()
+
+        # Shared with the GUI (core/history_manager.py) so scheduled runs
+        # land in the same persistent history as manual backups/restores/
+        # addons syncs — one on-disk log regardless of what triggered the run.
+        from .history_manager import HistoryManager
+        self._history = history or HistoryManager()
         self._stop    = threading.Event()
         self._paused  = threading.Event()   # set = paused, clear = running
         self._active_jobs: dict[str, threading.Thread] = {}
@@ -511,6 +519,8 @@ class BackupScheduler:
         rule_id = rule["id"]
         label   = rule.get("label") or rule.get("db_name", rule_id[:8])
         remote_tmp: list[str] = []
+        run_started_at = time.time()
+        log_lines: list[str] = []
 
         def log(msg: str) -> None:
             # Force [label] prefix on every line so concurrent client logs stay
@@ -519,6 +529,7 @@ class BackupScheduler:
             stripped = msg.lstrip()
             if not stripped.startswith(f"[{label}]"):
                 msg = f"[{label}] {stripped}"
+            log_lines.append(msg)
             self._log(rule_id, msg)
 
         log(f"[{label}] Iniciando backup programado — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -532,6 +543,10 @@ class BackupScheduler:
             self._sched._update_result(rule_id, "error", msg)
             notify_error(label, msg)
             self._refresh()
+            self._history.record(
+                "backup_scheduled", label, "", "error", msg,
+                "\n".join(log_lines), started_at=run_started_at,
+            )
             return
 
         ssh = SSHClient()
@@ -548,6 +563,10 @@ class BackupScheduler:
             self._sched._update_result(rule_id, "error", msg)
             notify_error(label, msg)
             self._refresh()
+            self._history.record(
+                "backup_scheduled", label, profile["host"], "error", msg,
+                "\n".join(log_lines), started_at=run_started_at,
+            )
             return
 
         # Tracks remote /tmp files this run creates so they get cleaned up
@@ -607,6 +626,10 @@ class BackupScheduler:
                 msg = "No hay nada que transferir (dump e filestore desactivados)."
                 log(f"[{label}] {msg}")
                 self._sched._update_result(rule_id, "error", msg)
+                self._history.record(
+                    "backup_scheduled", label, profile["host"], "error", msg,
+                    "\n".join(log_lines), started_at=run_started_at,
+                )
                 return
 
             # ── Phase B destination (resolved early — the bundle decision
@@ -832,12 +855,20 @@ class BackupScheduler:
             log(f"[{label}] {msg}")
             self._sched._update_result(rule_id, "ok", msg)
             notify_success(label, f"Backup diario completado\n{db_name}")
+            self._history.record(
+                "backup_scheduled", label, profile["host"], "ok", msg,
+                "\n".join(log_lines), started_at=run_started_at,
+            )
 
         except Exception as exc:
             msg = str(exc)
             log(f"[{label}] ERROR: {msg}")
             self._sched._update_result(rule_id, "error", msg)
             notify_error(label, f"Error en backup de {db_name}:\n{msg[:120]}")
+            self._history.record(
+                "backup_scheduled", label, profile["host"], "error", msg,
+                "\n".join(log_lines), started_at=run_started_at,
+            )
 
         finally:
             try:
