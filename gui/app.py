@@ -620,6 +620,11 @@ class BackupApp:
         self._v_a_service      = tk.StringVar(value="odoo")
         self._v_a_submodules   = tk.BooleanVar(value=False)  # use git submodule update sequence
         self._v_a_force_mirror = tk.BooleanVar(value=False)  # discard local drift, remote always wins
+        # Database to run `-u <modulos_cambiados>` against after a sync that
+        # touched module code — see _worker_addons. Binary/conf path are
+        # resolved from the service above (AddonsManager.resolve_service_launcher),
+        # not entered separately, so they can't drift out of sync with it.
+        self._v_a_db_name      = tk.StringVar()
 
         # SSH key source priority cascade:
         #   "server"   — key already on the remote server's ~/.ssh/
@@ -4880,38 +4885,55 @@ class BackupApp:
         sec4.columnconfigure(1, weight=1)
         row += 1
 
-        ttk.Checkbutton(
-            sec4,
-            text="Reiniciar servicio Odoo al terminar la sincronizacion",
-            variable=self._v_a_restart,
-            command=self._toggle_addons_restart,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-
+        # Service name is always enabled now — it's shared between "reiniciar
+        # servicio" (below) and the automatic `-u` database update (see
+        # _worker_addons), which needs it even when a restart isn't requested.
         ttk.Label(sec4, text="Nombre del servicio:").grid(
-            row=1, column=0, sticky="e", padx=(0, _PAD), pady=3
+            row=0, column=0, sticky="e", padx=(0, _PAD), pady=3
         )
         svc_row = ttk.Frame(sec4)
-        svc_row.grid(row=1, column=1, sticky="ew", pady=3)
+        svc_row.grid(row=0, column=1, sticky="ew", pady=3)
         svc_row.columnconfigure(0, weight=1)
 
-        self._e_a_service = ttk.Entry(svc_row, textvariable=self._v_a_service, state="disabled")
+        self._e_a_service = ttk.Entry(svc_row, textvariable=self._v_a_service)
         self._e_a_service.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self._btn_detect_svc = ttk.Button(
-            svc_row, text="Auto-detectar", state="disabled",
+            svc_row, text="Auto-detectar",
             command=self._action_detect_service,
         )
         self._btn_detect_svc.grid(row=0, column=1)
 
+        ttk.Label(sec4, text="Base de datos:").grid(
+            row=1, column=0, sticky="e", padx=(0, _PAD), pady=3
+        )
+        ttk.Entry(sec4, textvariable=self._v_a_db_name).grid(
+            row=1, column=1, sticky="ew", pady=3
+        )
+        tk.Label(
+            sec4,
+            text="  Si hay modulos con cambios tras el sync, se ofrece actualizarla "
+                 "(-u) antes de reiniciar — usa el binario/conf del servicio de arriba. "
+                 "Dejar vacio para omitir este paso.",
+            font=("Segoe UI", 8), fg="#666666", bg=_C_BG,
+            wraplength=480, justify="left",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        ttk.Checkbutton(
+            sec4,
+            text="Reiniciar servicio Odoo al terminar la sincronizacion",
+            variable=self._v_a_restart,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
         ttk.Separator(sec4, orient="horizontal").grid(
-            row=2, column=0, columnspan=3, sticky="ew", pady=6
+            row=4, column=0, columnspan=3, sticky="ew", pady=6
         )
 
         ttk.Checkbutton(
             sec4,
             text="Modo espejo forzado (el repositorio SIEMPRE gana, nunca mezcla)",
             variable=self._v_a_force_mirror,
-        ).grid(row=3, column=0, columnspan=3, sticky="w")
+        ).grid(row=5, column=0, columnspan=3, sticky="w")
         tk.Label(
             sec4,
             text="  Descarta cualquier cambio local en el servidor (git reset --hard + "
@@ -4920,7 +4942,7 @@ class BackupApp:
                  "identica al repositorio remoto — irreversible.",
             font=("Segoe UI", 8), fg="#E67E22", bg=_C_BG,
             wraplength=480, justify="left",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
         # ── Seccion 5: Progreso y ejecucion ──────────────────────────────
         sec5 = ttk.LabelFrame(f, text="5. Ejecucion", padding=_PAD)
@@ -4949,9 +4971,6 @@ class BackupApp:
             style="Stop.TButton", command=self._action_stop,
         )
         self._btn_stop_addons.pack(side="left", padx=6)
-
-        # Apply initial state for the restart option
-        self._toggle_addons_restart()
 
     # ── Addons: helpers ───────────────────────────────────────────────────
 
@@ -5106,11 +5125,15 @@ class BackupApp:
                 current.insert(0, path)
                 self._cb_a_ssh_key["values"] = current
 
-    def _toggle_addons_restart(self) -> None:
-        """Enable/disable the service name entry and auto-detect button."""
-        state = "normal" if self._v_a_restart.get() else "disabled"
-        self._e_a_service.config(state=state)
-        self._btn_detect_svc.config(state=state)
+    # Removed: the service name entry/button are now always enabled — the
+    # `-u` database update step (see _worker_addons) needs the service name
+    # to resolve the odoo binary/conf even when "reiniciar servicio" isn't
+    # checked, so gating them on that checkbox no longer made sense.
+    # def _toggle_addons_restart(self) -> None:
+    #     """Enable/disable the service name entry and auto-detect button."""
+    #     state = "normal" if self._v_a_restart.get() else "disabled"
+    #     self._e_a_service.config(state=state)
+    #     self._btn_detect_svc.config(state=state)
 
     def _get_key_passphrase(self, key_path: str) -> str | None:
         """
@@ -5310,6 +5333,7 @@ class BackupApp:
             "force_mirror":   self._v_a_force_mirror.get(),
             "restart":        self._v_a_restart.get(),
             "service":        self._v_a_service.get().strip(),
+            "db_name":        self._v_a_db_name.get().strip(),
         }
         threading.Thread(
             target=self._worker_addons, args=(params, ssh), daemon=True
@@ -5387,6 +5411,12 @@ class BackupApp:
                         return
                     mgr.deinit_submodules(p["target"], stale, log_callback=self._log)
 
+            # Snapshot "before" state so we can tell which modules actually
+            # changed once the sync lands — see diff_changed_modules(). None/
+            # empty on a first clone (nothing was "updated" yet).
+            before_head = mgr.get_head_commit(p["target"])
+            before_subs = mgr.get_submodule_status(p["target"])
+
             # Step 3: clone or pull (with optional submodule sequence)
             label = (
                 "Sincronizando repositorio y submódulos..."
@@ -5405,6 +5435,36 @@ class BackupApp:
                 cancel_event=self._cancel_event,
             )
             self._q.put(("addons_progress", (80, "Repositorio sincronizado.")))
+
+            # Step 3.5: if module code actually changed, offer to update the
+            # database before restarting — a git sync alone never applies
+            # new fields/views/data/migrations, only `-u` does.
+            if p["db_name"] and p["service"]:
+                after_head = mgr.get_head_commit(p["target"])
+                after_subs = mgr.get_submodule_status(p["target"])
+                changed = mgr.diff_changed_modules(
+                    p["target"], before_head, after_head, before_subs, after_subs,
+                )
+                if changed:
+                    names_list = "\n".join(f"  • {n}" for n in changed)
+                    proceed = self._ask_confirm(
+                        "Modulos modificados detectados",
+                        f"Se detectaron {len(changed)} modulo(s) con cambios en esta "
+                        f"sincronizacion:\n\n{names_list}\n\n"
+                        f"¿Actualizar la base de datos '{p['db_name']}' con estos cambios "
+                        "(-u) antes de continuar? Puede tardar varios minutos.",
+                    )
+                    if proceed:
+                        self._q.put(("addons_progress", (85, "Actualizando modulos en la base de datos...")))
+                        binary, conf_path = mgr.resolve_service_launcher(p["service"])
+                        mgr.update_db_modules(
+                            p["db_name"], changed, conf_path, binary,
+                            odoo_user=p["odoo_user"],
+                            log_callback=self._log,
+                            cancel_event=self._cancel_event,
+                        )
+                    else:
+                        self._log("Actualizacion de base de datos omitida por el usuario.")
 
             # Step 4: optional service restart
             if p["restart"] and p["service"]:

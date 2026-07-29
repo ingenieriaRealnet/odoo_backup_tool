@@ -31,8 +31,10 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shlex
 import socket
+import time
 from typing import Callable
 
 import paramiko
@@ -927,6 +929,111 @@ class AddonsManager:
         if log_callback:
             log_callback("  Submódulos sincronizados correctamente.")
 
+    # ── Changed-module detection (for -u database updates) ────────────────
+
+    def get_head_commit(self, target_path: str) -> str | None:
+        """
+        Return the current HEAD commit SHA of target_path's checkout, or
+        None if it doesn't exist yet / isn't a git repo (e.g. before a
+        first clone). Called by the caller (gui/app.py's _worker_addons)
+        before and after sync() to snapshot state for diff_changed_modules().
+        """
+        code, out, _ = self._ssh.execute(
+            f"cd {target_path} && git -c safe.directory=* rev-parse HEAD 2>/dev/null"
+        )
+        return out.strip() if code == 0 and out.strip() else None
+
+    def get_submodule_status(self, target_path: str) -> dict[str, str]:
+        """
+        Return {submodule_name: commit_sha} for every submodule currently
+        checked out under target_path. Empty dict if target_path doesn't
+        exist yet or has no submodules.
+        """
+        code, out, _ = self._ssh.execute(
+            f"cd {target_path} && git -c safe.directory=* submodule status 2>/dev/null"
+        )
+        if code != 0:
+            return {}
+        status: dict[str, str] = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Format: "[+-U ]<sha> <path> (<describe>)" — a leading +/-/U
+            # marks out-of-sync/uninitialized/conflicted, absent for clean.
+            parts = line.lstrip("+-U ").split(" ", 1)
+            if len(parts) < 2:
+                continue
+            sha = parts[0]
+            path = parts[1].split(" ", 1)[0]
+            status[path] = sha
+        return status
+
+    def _list_module_dirs(self, target_path: str) -> set[str]:
+        """
+        Top-level directory names under target_path that look like Odoo
+        addons (contain __manifest__.py) — used to filter changed-file
+        diffs down to real modules for the -u module list.
+        """
+        code, out, _ = self._ssh.execute(
+            f"cd {target_path} && for d in */; do "
+            f"[ -f \"$d/__manifest__.py\" ] && echo \"${{d%/}}\"; done 2>/dev/null"
+        )
+        return set(out.splitlines()) if code == 0 else set()
+
+    def diff_changed_modules(
+        self,
+        target_path: str,
+        before_head: str | None,
+        after_head: str | None,
+        before_submodules: dict[str, str],
+        after_submodules: dict[str, str],
+    ) -> list[str]:
+        """
+        Determine which addon modules actually changed between a before/after
+        snapshot of the checkout (see get_head_commit()/get_submodule_status(),
+        captured by the caller right before and after sync()).
+
+        Combines two signals:
+          - Submodules whose pinned commit moved (covers the common case
+            where every addon is its own git submodule).
+          - Top-level, non-submodule directories with file changes in the
+            main repo's own history between before_head and after_head
+            (covers addons tracked directly in the superproject).
+
+        Returns only names that are real Odoo modules (have __manifest__.py)
+        — this list feeds update_db_modules()'s `-u` argument. Empty list if
+        before_head is None: on a first clone nothing was "updated", it's
+        all brand new and not yet installed in any database (an -i install
+        is a different operation, out of scope here).
+        """
+        if before_head is None or after_head is None:
+            return []
+
+        module_dirs = self._list_module_dirs(target_path)
+        changed: set[str] = set()
+
+        # Submodules whose commit moved
+        for name, sha in after_submodules.items():
+            if before_submodules.get(name) != sha:
+                changed.add(name)
+
+        # Directly-tracked (non-submodule) module dirs with file changes
+        non_submodule_dirs = module_dirs - set(after_submodules.keys())
+        if before_head != after_head and non_submodule_dirs:
+            code, out, _ = self._ssh.execute(
+                f"cd {target_path} && "
+                f"git -c safe.directory=* diff --name-only {before_head} {after_head} -- "
+                + " ".join(non_submodule_dirs)
+            )
+            if code == 0:
+                for line in out.splitlines():
+                    top = line.split("/", 1)[0]
+                    if top in non_submodule_dirs:
+                        changed.add(top)
+
+        return sorted(changed & module_dirs)
+
     # ── Odoo service management ───────────────────────────────────────────
 
     def detect_odoo_service(self) -> str | None:
@@ -968,3 +1075,129 @@ class AddonsManager:
 
         if log_callback:
             log_callback(f"Servicio '{service_name}' reiniciado correctamente.")
+
+    def resolve_service_launcher(self, service_name: str) -> tuple[str, str]:
+        """
+        Infer the Odoo binary path and config file used by a systemd
+        service, by reading its ExecStart= directive.
+
+        Used by update_db_modules() so the user only has to name the
+        database — the binary and config path come from whatever the
+        service is already configured to run, instead of a second field
+        that could drift out of sync with the service's real launch command.
+
+        Returns:
+            (odoo_binary_path, conf_path)
+
+        Raises:
+            RuntimeError: If the service's ExecStart can't be read, or
+                          doesn't use -c for its config file.
+        """
+        code, out, err = self._ssh.execute(
+            f"systemctl show {service_name} --property=ExecStart --no-pager 2>&1"
+        )
+        if code != 0 or not out.strip():
+            raise RuntimeError(
+                f"No se pudo leer la configuracion del servicio '{service_name}':\n{err or out}"
+            )
+
+        m = re.search(r"argv\[\]=(.*?)\s*;", out)
+        if not m:
+            raise RuntimeError(
+                f"No se pudo interpretar el ExecStart del servicio '{service_name}':\n{out}"
+            )
+        argv = m.group(1).split()
+
+        # The launcher isn't always the odoo binary directly — e.g. a venv
+        # service runs "<python> <odoo-script> -c ... -d ...". Take every
+        # leading token that isn't a flag (interpreter + script, or just the
+        # binary if it's invoked directly) so update_db_modules() reproduces
+        # the exact same invocation the service itself uses.
+        prefix: list[str] = []
+        for tok in argv:
+            if tok.startswith("-"):
+                break
+            prefix.append(tok)
+        if not prefix:
+            raise RuntimeError(
+                f"No se pudo determinar el comando de arranque de '{service_name}' "
+                f"a partir de su ExecStart:\n{out}"
+            )
+
+        conf_match = re.search(r"(?:-c|--config)[ =](\S+)", " ".join(argv))
+        if not conf_match:
+            raise RuntimeError(
+                f"El servicio '{service_name}' no especifica un archivo de configuracion "
+                f"(-c/--config) en su ExecStart:\n{out}\n\n"
+                "Verifique manualmente la ruta del odoo.conf de este servidor."
+            )
+        return " ".join(prefix), conf_match.group(1)
+
+    def update_db_modules(
+        self,
+        db_name: str,
+        modules: list[str],
+        conf_path: str,
+        odoo_bin: str,
+        odoo_user: str = "odoo",
+        log_callback: Callable[[str], None] | None = None,
+        cancel_event=None,
+    ) -> None:
+        """
+        Apply pending module upgrades to db_name for the given modules — the
+        step Odoo needs after new module code lands on disk (git sync) before
+        it actually takes effect in the database (new fields, views, data,
+        migrations). Runs as odoo_user via `sudo -u`, matching how the
+        service itself runs, with --stop-after-init so it exits once done
+        rather than staying up as a second live instance.
+
+        Raises:
+            RuntimeError: If the update command fails.
+        """
+        if not modules:
+            return
+        module_list = ",".join(modules)
+        if log_callback:
+            log_callback(
+                f"Actualizando {len(modules)} modulo(s) en la base de datos "
+                f"'{db_name}': {module_list} ..."
+            )
+
+        # Odoo's own --logfile, tailed for heartbeat — without this the
+        # whole -u run was silent until it finished (or failed), which made
+        # it look instantaneous/broken even when it was genuinely still
+        # running for several minutes. Own temp file (not the service's
+        # production log) so this ad-hoc run's output doesn't interleave
+        # with — or contend for — the live service's own logfile.
+        log_file = f"/tmp/.obt_update_{int(time.time())}.log"
+        cmd = (
+            f"sudo -u {odoo_user} {odoo_bin} -c {conf_path} -d {db_name} "
+            f"-u {module_list} --without-demo=1 --stop-after-init --no-http "
+            f"--logfile={log_file} 2>&1"
+        )
+
+        def _heartbeat(_status: str) -> None:
+            if not log_callback:
+                return
+            _, out, _ = self._ssh.execute(f"tail -n 1 {log_file} 2>/dev/null")
+            if out.strip():
+                log_callback(f"  [actualizando BD] {out.strip()}")
+
+        try:
+            code, _, err = self._ssh.execute_long(
+                cmd,
+                watch_cmd=f"tail -n 1 {log_file} 2>/dev/null",
+                heartbeat_callback=_heartbeat,
+                heartbeat_interval=10,
+                timeout=1800,
+                cancel_event=cancel_event,
+            )
+        finally:
+            self._ssh.execute(f"rm -f {log_file}")
+
+        if code != 0:
+            raise RuntimeError(
+                f"Error actualizando modulos en '{db_name}':\n\n{err}"
+            )
+        if log_callback:
+            log_callback(f"Base de datos '{db_name}' actualizada correctamente.")
