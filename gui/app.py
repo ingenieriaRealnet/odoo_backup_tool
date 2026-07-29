@@ -5439,13 +5439,29 @@ class BackupApp:
             # Step 3.5: if module code actually changed, offer to update the
             # database before restarting — a git sync alone never applies
             # new fields/views/data/migrations, only `-u` does.
-            if p["db_name"] and p["service"]:
+            if not p["db_name"]:
+                self._log(
+                    "Actualizacion de base de datos omitida: no se indico "
+                    "una base de datos en el Tab 7 (campo 'Base de datos')."
+                )
+            elif not p["service"]:
+                self._log(
+                    "Actualizacion de base de datos omitida: no hay un "
+                    "servicio configurado (necesario para resolver el binario/conf de Odoo)."
+                )
+            else:
+                self._log("Verificando modulos con cambios desde el ultimo sync...")
                 after_head = mgr.get_head_commit(p["target"])
                 after_subs = mgr.get_submodule_status(p["target"])
                 changed = mgr.diff_changed_modules(
                     p["target"], before_head, after_head, before_subs, after_subs,
                 )
-                if changed:
+                if not changed:
+                    self._log(
+                        "No se detectaron modulos con cambios en esta sincronizacion "
+                        f"— se omite la actualizacion de '{p['db_name']}'."
+                    )
+                else:
                     names_list = "\n".join(f"  • {n}" for n in changed)
                     proceed = self._ask_confirm(
                         "Modulos modificados detectados",
