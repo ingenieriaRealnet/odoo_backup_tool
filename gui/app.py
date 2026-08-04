@@ -4904,7 +4904,7 @@ class BackupApp:
         )
         self._btn_detect_svc.grid(row=0, column=1)
 
-        ttk.Label(sec4, text="Base de datos:").grid(
+        ttk.Label(sec4, text="Base(s) de datos:").grid(
             row=1, column=0, sticky="e", padx=(0, _PAD), pady=3
         )
         ttk.Entry(sec4, textvariable=self._v_a_db_name).grid(
@@ -4912,9 +4912,11 @@ class BackupApp:
         )
         tk.Label(
             sec4,
-            text="  Si hay modulos con cambios tras el sync, se ofrece actualizarla "
+            text="  Si hay modulos con cambios tras el sync, se ofrece actualizarlas "
                  "(-u) antes de reiniciar — usa el binario/conf del servicio de arriba. "
-                 "Dejar vacio para omitir este paso.",
+                 "Varias bases separadas por coma (ej: limatec_test, limatec_prod) se "
+                 "actualizan una por una, nunca en paralelo — si una falla, se detiene "
+                 "ahi y no continua con las siguientes. Dejar vacio para omitir este paso.",
             font=("Segoe UI", 8), fg="#666666", bg=_C_BG,
             wraplength=480, justify="left",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
@@ -5437,12 +5439,19 @@ class BackupApp:
             self._q.put(("addons_progress", (80, "Repositorio sincronizado.")))
 
             # Step 3.5: if module code actually changed, offer to update the
-            # database before restarting — a git sync alone never applies
-            # new fields/views/data/migrations, only `-u` does.
-            if not p["db_name"]:
+            # database(s) before restarting — a git sync alone never applies
+            # new fields/views/data/migrations, only `-u` does. Multiple
+            # databases (comma-separated) update ONE AT A TIME, never in
+            # parallel — each -u is heavy (locks tables, real CPU/IO), and
+            # running several against the same Postgres server at once risks
+            # contention or lock collisions if they share anything. If one
+            # fails, the loop stops there rather than continuing to the rest,
+            # so a partial failure never gets masked by "later ones worked".
+            db_names = [d.strip() for d in p["db_name"].split(",") if d.strip()]
+            if not db_names:
                 self._log(
                     "Actualizacion de base de datos omitida: no se indico "
-                    "una base de datos en el Tab 7 (campo 'Base de datos')."
+                    "ninguna base de datos en el Tab 7 (campo 'Base(s) de datos')."
                 )
             elif not p["service"]:
                 self._log(
@@ -5459,26 +5468,30 @@ class BackupApp:
                 if not changed:
                     self._log(
                         "No se detectaron modulos con cambios en esta sincronizacion "
-                        f"— se omite la actualizacion de '{p['db_name']}'."
+                        f"— se omite la actualizacion de {', '.join(db_names)}."
                     )
                 else:
                     names_list = "\n".join(f"  • {n}" for n in changed)
+                    dbs_list = "\n".join(f"  • {d}" for d in db_names)
                     proceed = self._ask_confirm(
                         "Modulos modificados detectados",
                         f"Se detectaron {len(changed)} modulo(s) con cambios en esta "
                         f"sincronizacion:\n\n{names_list}\n\n"
-                        f"¿Actualizar la base de datos '{p['db_name']}' con estos cambios "
-                        "(-u) antes de continuar? Puede tardar varios minutos.",
+                        f"¿Actualizar estas base(s) de datos con estos cambios (-u), "
+                        f"una por una?\n\n{dbs_list}\n\n"
+                        "Puede tardar varios minutos por cada una.",
                     )
                     if proceed:
-                        self._q.put(("addons_progress", (85, "Actualizando modulos en la base de datos...")))
                         binary, conf_path = mgr.resolve_service_launcher(p["service"])
-                        mgr.update_db_modules(
-                            p["db_name"], changed, conf_path, binary,
-                            odoo_user=p["odoo_user"],
-                            log_callback=self._log,
-                            cancel_event=self._cancel_event,
-                        )
+                        for i, db in enumerate(db_names, 1):
+                            self._q.put(("addons_progress",
+                                (85, f"Actualizando '{db}' ({i}/{len(db_names)})...")))
+                            mgr.update_db_modules(
+                                db, changed, conf_path, binary,
+                                odoo_user=p["odoo_user"],
+                                log_callback=self._log,
+                                cancel_event=self._cancel_event,
+                            )
                     else:
                         self._log("Actualizacion de base de datos omitida por el usuario.")
 
