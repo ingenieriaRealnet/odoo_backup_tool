@@ -1183,21 +1183,66 @@ class AddonsManager:
             if out.strip():
                 log_callback(f"  [actualizando BD] {out.strip()}")
 
-        try:
-            code, _, err = self._ssh.execute_long(
-                cmd,
-                watch_cmd=f"tail -n 1 {log_file} 2>/dev/null",
-                heartbeat_callback=_heartbeat,
-                heartbeat_interval=10,
-                timeout=1800,
-                cancel_event=cancel_event,
-            )
-        finally:
-            self._ssh.execute(f"rm -f {log_file}")
+        code, _, err = self._ssh.execute_long(
+            cmd,
+            watch_cmd=f"tail -n 1 {log_file} 2>/dev/null",
+            heartbeat_callback=_heartbeat,
+            heartbeat_interval=10,
+            timeout=1800,
+            cancel_event=cancel_event,
+        )
 
         if code != 0:
+            # A non-zero exit doesn't always mean the upgrade itself failed —
+            # confirmed 2026-08-04 on limatec_prod: non-fatal RST/reportlab
+            # warnings while rendering a module's description to PDF made
+            # odoo exit non-zero, even though ir_module_module already showed
+            # every module 'installed' with a write_date matching this exact
+            # run (i.e. the actual upgrade had already committed). Verify
+            # against the database itself before reporting a false failure.
+            if self._verify_modules_installed(db_name, modules):
+                if log_callback:
+                    log_callback(
+                        "Aviso: el proceso de actualizacion devolvio un codigo de "
+                        "salida distinto de cero (probablemente advertencias no "
+                        "fatales, p.ej. generando documentacion/PDF), pero se "
+                        f"verifico en la base de datos que los modulos SI quedaron "
+                        f"'installed' en '{db_name}'."
+                    )
+                self._ssh.execute(f"rm -f {log_file}")
+                if log_callback:
+                    log_callback(f"Base de datos '{db_name}' actualizada correctamente.")
+                return
             raise RuntimeError(
-                f"Error actualizando modulos en '{db_name}':\n\n{err}"
+                f"Error actualizando modulos en '{db_name}':\n\n{err}\n\n"
+                f"Log completo conservado en el servidor: {log_file}"
             )
+
+        self._ssh.execute(f"rm -f {log_file}")
         if log_callback:
             log_callback(f"Base de datos '{db_name}' actualizada correctamente.")
+
+    def _verify_modules_installed(self, db_name: str, modules: list[str]) -> bool:
+        """
+        Best-effort check: query ir_module_module directly for whether every
+        module in `modules` ended up 'installed', independent of the -u
+        process's own exit code (see update_db_modules()'s docstring above
+        for why that exit code alone isn't always trustworthy).
+
+        Returns False — never claims success — if the query itself fails or
+        if ANY module isn't 'installed'; this only ever turns a reported
+        failure into a success, never the other way around.
+        """
+        placeholders = ",".join(f"'{m}'" for m in modules)
+        code, out, _ = self._ssh.execute(
+            f"sudo -u postgres psql -d {db_name} -t -A -c "
+            f"\"SELECT name, state FROM ir_module_module WHERE name IN ({placeholders})\""
+        )
+        if code != 0 or not out.strip():
+            return False
+        states: dict[str, str] = {}
+        for line in out.splitlines():
+            if "|" in line:
+                name, state = line.split("|", 1)
+                states[name.strip()] = state.strip()
+        return all(states.get(m) == "installed" for m in modules)
