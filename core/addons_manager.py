@@ -637,10 +637,24 @@ class AddonsManager:
             # (the non-mirror path below) either refuses to run or produces
             # a merge commit when production has local drift — neither is
             # "production is a mirror of the repo" (see docstring above).
+            #
+            # Explicit refspec (origin/{branch}:refs/remotes/origin/{branch})
+            # instead of a bare `fetch origin {branch}`: the first clone uses
+            # --single-branch, which restricts the remote's configured fetch
+            # refspec to just the branch cloned. If force_mirror later targets
+            # a DIFFERENT branch on that same existing checkout, a bare fetch
+            # brings the commits into FETCH_HEAD but never creates/updates
+            # origin/{branch} (still outside the restricted refspec), so the
+            # subsequent `reset --hard origin/{branch}` fails with "unknown
+            # revision" even though the fetch itself succeeded. Confirmed
+            # 2026-08-05 on Pruebas_18: cloned single-branch on develop,
+            # later targeted branch=main. The explicit refspec always creates/
+            # updates that ref regardless of the configured restriction.
             cmd = (
                 f"cd {target_path} && "
                 f"GIT_SSH={_REMOTE_SSH_WRAPPER} "
-                f"git -c safe.directory=* fetch origin {branch} && "
+                f"git -c safe.directory=* fetch origin "
+                f"+{branch}:refs/remotes/origin/{branch} && "
                 f"git -c safe.directory=* reset --hard origin/{branch} && "
                 f"git -c safe.directory=* clean -fd"
             )
