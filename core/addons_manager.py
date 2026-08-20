@@ -1184,8 +1184,18 @@ class AddonsManager:
         # production log) so this ad-hoc run's output doesn't interleave
         # with — or contend for — the live service's own logfile.
         log_file = f"/tmp/.obt_update_{int(time.time())}.log"
+        # cd /tmp first: without an explicit working directory, `sudo -u
+        # {odoo_user}` inherits the SSH session's cwd (typically /root),
+        # which the odoo OS user usually can't even stat(), let alone read.
+        # Confirmed 2026-08-20 on bancasa_prod: a module with no
+        # static/description/index.html fell back to rendering its RST
+        # description, and docutils' search for html4css1.css in the cwd
+        # crashed with PermissionError — not a warning, it aborted the
+        # entire registry load mid-upgrade. /tmp is world-readable on any
+        # normal Linux server, so this sidesteps the whole class of issue
+        # regardless of which OS user the service actually runs as.
         cmd = (
-            f"sudo -u {odoo_user} {odoo_bin} -c {conf_path} -d {db_name} "
+            f"cd /tmp && sudo -u {odoo_user} {odoo_bin} -c {conf_path} -d {db_name} "
             f"-u {module_list} --without-demo=1 --stop-after-init --no-http "
             f"--logfile={log_file} 2>&1"
         )
