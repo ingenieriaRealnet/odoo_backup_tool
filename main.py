@@ -15,6 +15,17 @@ import tkinter as tk
 
 from gui.app import BackupApp
 
+# tkinterdnd2 requires the root window itself to be created via its own
+# TkinterDnD.Tk() subclass — a plain tk.Tk() root would make every panel's
+# drop_target_register() call fail silently. Falls back to a normal Tk root
+# if the dependency isn't installed (dev environment) — the Explorer tab's
+# drag-and-drop just won't register in that case; everything else still works.
+try:
+    from tkinterdnd2 import TkinterDnD
+    _DND_ROOT_CLS = TkinterDnD.Tk
+except ImportError:
+    _DND_ROOT_CLS = tk.Tk
+
 
 def _set_window_icon(root: tk.Tk) -> None:
     """
@@ -37,7 +48,7 @@ def _set_window_icon(root: tk.Tk) -> None:
 
 
 def main() -> None:
-    root = tk.Tk()
+    root = _DND_ROOT_CLS()
     _set_window_icon(root)
     BackupApp(root)
     root.mainloop()

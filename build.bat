@@ -50,6 +50,7 @@ pyinstaller ^
     --hidden-import plyer.platforms ^
     --hidden-import plyer.platforms.win ^
     --hidden-import plyer.platforms.win.notification ^
+    --collect-all tkinterdnd2 ^
     --add-data "icon.ico;." ^
     main.py
 

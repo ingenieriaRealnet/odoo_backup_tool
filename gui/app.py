@@ -36,6 +36,7 @@ from core.trial_manager import TrialManager
 from core.scheduler import ScheduleManager, BackupScheduler
 from core.bundle_manager import BundleManager
 from core.temp_registry import RemoteTempRegistry, sweep_orphaned_files
+from core.history_manager import HistoryManager
 
 def _add_timestamp(filename: str) -> str:
     """Insert a timestamp before the file extension: file.dump → file_2026-06-25_14-03.dump"""
@@ -173,6 +174,15 @@ _FROZEN_ACTIVITY_THRESHOLD_SECS = 90
 # Selecting it is equivalent to "no profile selected" — triggers the
 # create-new-profile path when the user clicks Guardar.
 _PROFILE_NEW = "— Nuevo perfil —"
+
+# Display labels for HistoryManager action_type values — see core/history_manager.py
+_HISTORY_TYPE_LABELS = {
+    "backup_manual":    "Backup manual",
+    "backup_scheduled": "Backup programado",
+    "restore":          "Restauracion",
+    "addons_sync":      "Sync addons",
+    "terminal":         "Terminal SSH",
+}
 
 # Persistent settings file (geometry, sash position)
 _SETTINGS_FILE = os.path.join(
@@ -537,6 +547,26 @@ class BackupApp:
         # See core/temp_registry.py.
         self._temp_registry = RemoteTempRegistry()
 
+        # Persistent, cross-restart record of every backup/restore/addons-sync
+        # run — unlike self.log_widget (Tab log panel), which is cleared on
+        # every app close by design. See core/history_manager.py and the
+        # "Historial" tab. Shared with BackupScheduler so scheduled runs land
+        # in the same on-disk log as manual ones.
+        self._history = HistoryManager()
+        # Buffers the currently in-progress operation's log lines/metadata so
+        # they can be flushed to self._history once it finishes — see
+        # _history_begin()/_history_end() below. Only one slot: manual
+        # backup/restore/addons-sync are treated as mutually exclusive, same
+        # simplification the single shared log_widget already makes.
+        self._current_op_meta: dict | None = None
+        self._current_op_log: list[str] = []
+
+        # Tracks whichever scrollable-tab canvas the mouse is currently over
+        # (set by _bind_mousewheel's Enter/Leave handlers) — used by
+        # _on_combobox_scroll to redirect scroll-over-a-combobox to the page
+        # instead of letting ttk cycle the combobox's own selected value.
+        self._active_scroll_canvas: tk.Canvas | None = None
+
         # ── Backup state variables ────────────────────────────────────────
         self._v_db = tk.StringVar()
         self._v_dump_fmt = tk.StringVar(value="dump")
@@ -590,6 +620,11 @@ class BackupApp:
         self._v_a_service      = tk.StringVar(value="odoo")
         self._v_a_submodules   = tk.BooleanVar(value=False)  # use git submodule update sequence
         self._v_a_force_mirror = tk.BooleanVar(value=False)  # discard local drift, remote always wins
+        # Database to run `-u <modulos_cambiados>` against after a sync that
+        # touched module code — see _worker_addons. Binary/conf path are
+        # resolved from the service above (AddonsManager.resolve_service_launcher),
+        # not entered separately, so they can't drift out of sync with it.
+        self._v_a_db_name      = tk.StringVar()
 
         # SSH key source priority cascade:
         #   "server"   — key already on the remote server's ~/.ssh/
@@ -634,6 +669,7 @@ class BackupApp:
         self._scheduler = BackupScheduler(
             self._sched_mgr, self._profiles, self._q,
             temp_registry=self._temp_registry,
+            history=self._history,
         )
         self._scheduler.start()
 
@@ -839,6 +875,11 @@ class BackupApp:
     def _build_ui(self) -> None:
         """Assemble status bar, header, resizable notebook+log paned area."""
 
+        # Overrides ttk's default "scroll wheel cycles the value" behavior
+        # for every Combobox in the app — see _on_combobox_scroll(). One
+        # class-level binding covers every tab instead of wiring each combo.
+        self.root.bind_class("TCombobox", "<MouseWheel>", self._on_combobox_scroll)
+
         # ── Status bar — packed first so it stays at the bottom ──────────
         self._build_status_bar()
 
@@ -954,6 +995,7 @@ class BackupApp:
         self._tab_terminal()
         self._tab_trial()
         self._tab_automation()
+        self._tab_history()
 
         # Lock backup tabs 2-5 until connected
         for i in range(1, 5):
@@ -995,6 +1037,8 @@ class BackupApp:
             self.root.after(100, self._auto_connect_terminal)
         elif idx == 9:  # Tab Trial
             self.root.after(100, self._auto_refresh_trial)
+        elif idx == 11:  # Tab Historial
+            self.root.after(100, self._refresh_history_tree)
 
     def _auto_connect_explorer(self) -> None:
         """Connect explorer panels that are not yet connected, if SSH is active."""
@@ -1230,8 +1274,7 @@ class BackupApp:
 
     # ── Scroll isolation helper ───────────────────────────────────────────
 
-    @staticmethod
-    def _bind_mousewheel(canvas: tk.Canvas) -> None:
+    def _bind_mousewheel(self, canvas: tk.Canvas) -> None:
         """
         Scope mousewheel scrolling to `canvas` only while the pointer is inside it.
 
@@ -1240,19 +1283,42 @@ class BackupApp:
         window (a known tkinter gotcha when multiple scrollable panels exist).
 
         Using <Enter>/<Leave> events to install/remove the binding limits the
-        handler to the canvas currently under the mouse pointer.
+        handler to the canvas currently under the mouse pointer. Also tracks
+        self._active_scroll_canvas so the "TCombobox" class binding installed
+        in _build_ui (see _on_combobox_scroll) knows which canvas to scroll
+        when the pointer happens to be over a combobox instead of over open
+        canvas space.
         """
         def _on_scroll(event: tk.Event) -> None:
             canvas.yview_scroll(-1 * (event.delta // 120), "units")
 
         def _enter(_event: tk.Event) -> None:
             canvas.bind_all("<MouseWheel>", _on_scroll)
+            self._active_scroll_canvas = canvas
 
         def _leave(_event: tk.Event) -> None:
             canvas.unbind_all("<MouseWheel>")
+            if self._active_scroll_canvas is canvas:
+                self._active_scroll_canvas = None
 
         canvas.bind("<Enter>", _enter)
         canvas.bind("<Leave>", _leave)
+
+    def _on_combobox_scroll(self, event: tk.Event) -> str:
+        """
+        Class-level <MouseWheel> handler bound to "TCombobox" (see _build_ui).
+
+        ttk.Combobox's own default binding cycles its selected value on
+        mousewheel scroll — surprising and unwanted when the user is just
+        scrolling past it to read the rest of a scrollable tab, not trying to
+        change the field. This replaces that behavior: forward the scroll to
+        whichever canvas is currently active (see _bind_mousewheel) instead,
+        so a combobox behaves like any other static content while scrolling.
+        Returning "break" stops ttk's own class binding from also firing.
+        """
+        if self._active_scroll_canvas is not None:
+            self._active_scroll_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        return "break"
 
     # ── Help window ──────────────────────────────────────────────────────
 
@@ -1392,6 +1458,11 @@ class BackupApp:
         self._v_progress.set(0)
         self._lbl_progress.config(text="")
         self._begin_operation()
+        self._history_begin(
+            "backup_manual",
+            self._server_label_for(self._cb_profile.get(), self._ssh.host),
+            self._ssh.host or "",
+        )
 
         threading.Thread(
             target=self._worker_transfer_only,
@@ -2752,6 +2823,11 @@ class BackupApp:
         self._v_progress.set(0)
         self._lbl_progress.config(text="")
         self._begin_operation()
+        self._history_begin(
+            "backup_manual",
+            self._server_label_for(self._cb_profile.get(), self._ssh.host),
+            self._ssh.host or "",
+        )
 
         # Snapshot all parameters before entering the thread
         params = {
@@ -3164,6 +3240,66 @@ class BackupApp:
         self._btn_stop_restore.config(state="disabled")
         self._btn_stop_addons.config(state="disabled")
 
+    def _server_label_for(self, combo_value: str, host: str) -> str:
+        """Profile name for the history table, falling back to the host
+        when no saved profile is selected (e.g. ad-hoc connection)."""
+        combo_value = (combo_value or "").strip()
+        if combo_value and combo_value != _PROFILE_NEW:
+            return combo_value
+        return host or "?"
+
+    def _history_begin(self, action_type: str, server_label: str, host: str) -> None:
+        """
+        Mark the start of a manual operation (backup/restore/addons sync) for
+        the persistent history log. Every line subsequently appended via
+        self._log()/_append_log() is captured until _history_end() flushes it.
+        """
+        self._current_op_meta = {
+            "action_type": action_type,
+            "server_label": server_label,
+            "host": host,
+            "started_at": time.time(),
+        }
+        self._current_op_log = []
+
+    def _history_end(self, status: str, summary: str) -> None:
+        """Flush the buffered operation (if any) to self._history."""
+        meta = self._current_op_meta
+        if meta is None:
+            return
+        self._history.record(
+            action_type=meta["action_type"],
+            server_label=meta["server_label"],
+            host=meta["host"],
+            status=status,
+            summary=summary,
+            log_text="\n".join(self._current_op_log),
+            started_at=meta["started_at"],
+        )
+        self._current_op_meta = None
+        self._current_op_log = []
+
+    def _on_terminal_session_end(self, host: str, panel_title: str, commands: list[str]) -> None:
+        """
+        Log a closed SSH Terminal (Tab 9) session to the persistent history.
+        Called from SshTerminalPanel.disconnect() — see gui/ssh_terminal_panel.py.
+        Commands are the only thing captured (not full terminal output/scrollback,
+        which is mostly prompts and command noise not useful for an audit trail).
+        """
+        summary = (
+            f"Sesion de terminal — {len(commands)} comando(s) ejecutado(s)"
+            if commands else "Sesion de terminal — sin comandos ejecutados"
+        )
+        log_text = "\n".join(f"$ {c}" for c in commands)
+        self._history.record(
+            action_type="terminal",
+            server_label=panel_title,
+            host=host,
+            status="ok",
+            summary=summary,
+            log_text=log_text,
+        )
+
     # ── Overwrite dialog (called from worker thread) ──────────────────────
 
     def _ask_overwrite(self, filename: str, dest_desc: str) -> tuple[str, str]:
@@ -3182,6 +3318,20 @@ class BackupApp:
         self._q.put(("ask_overwrite", (filename, dest_desc, event, result)))
         event.wait()
         return result.get("action", "cancel"), result.get("filename", filename)
+
+    def _ask_confirm(self, title: str, message: str) -> bool:
+        """
+        Show a yes/no confirmation dialog from a background worker thread and
+        block until the user answers. Same blocking pattern as _ask_overwrite()
+        — the dialog itself must run on the GUI thread, so this posts a queue
+        event and waits on a threading.Event the GUI thread sets after the
+        user responds.
+        """
+        event = threading.Event()
+        result: dict = {}
+        self._q.put(("ask_confirm", (title, message, event, result)))
+        event.wait()
+        return result.get("confirmed", False)
 
     # ── Thread-safe GUI updates ───────────────────────────────────────────
 
@@ -3283,6 +3433,7 @@ class BackupApp:
                     self._btn_run.config(state="normal")
                     self._set_status_op("Detenido", color="#888888")
                     self._end_operation()
+                    self._history_end("cancelled", data)
                     messagebox.showwarning(APP_TITLE, data)
 
                 elif event == "done":
@@ -3292,11 +3443,14 @@ class BackupApp:
                     self._btn_run.config(state="normal")
                     self._set_status_op("✓ Completado", color="#2E8B57")
                     self._end_operation()
+                    self._history_end("ok", data)
                     messagebox.showinfo(APP_TITLE, data)
 
                 elif event == "error":
                     self._append_log(f"[ERROR] {data}")
                     self._set_status_op("✗ Error (ver log)", color="#C0392B")
+                    self._end_operation()
+                    self._history_end("error", data)
                     messagebox.showerror(APP_TITLE, data)
 
                 elif event == "btn_enable":
@@ -3310,6 +3464,11 @@ class BackupApp:
                     action, final_name = _OverwriteDialog(self.root, filename, dest_desc).show()
                     result["action"] = action
                     result["filename"] = final_name
+                    ev.set()   # unblock the worker thread
+
+                elif event == "ask_confirm":
+                    title, message, ev, result = data
+                    result["confirmed"] = messagebox.askyesno(title, message, parent=self.root)
                     ev.set()   # unblock the worker thread
 
                 # ── Restore events ────────────────────────────────────────
@@ -3357,6 +3516,7 @@ class BackupApp:
                     self._btn_restore.config(state="normal")
                     self._set_status_op("Detenido", color="#888888")
                     self._end_operation()
+                    self._history_end("cancelled", data)
                     messagebox.showwarning(APP_TITLE, data)
 
                 elif event == "r_done":
@@ -3366,6 +3526,7 @@ class BackupApp:
                     self._btn_restore.config(state="normal")
                     self._set_status_op("✓ Completado", color="#2E8B57")
                     self._end_operation()
+                    self._history_end("ok", data)
                     messagebox.showinfo(APP_TITLE, data)
 
                 elif event == "btn_r_enable":
@@ -3395,6 +3556,10 @@ class BackupApp:
                     body += "Consulte el log completo para el detalle de cada verificacion."
 
                     self._append_log(f"[ERROR] Verificacion post-restauracion fallo para '{db}'.")
+                    self._history_end(
+                        "warning",
+                        f"Restauracion de '{db}' completada con problemas de verificacion.",
+                    )
                     messagebox.showerror(APP_TITLE, body)
 
                 # ── Addons sync events ────────────────────────────────────
@@ -3441,6 +3606,7 @@ class BackupApp:
                     self._btn_sync_addons.config(state="normal")
                     self._set_status_op("✓ Completado", color="#2E8B57")
                     self._end_operation()
+                    self._history_end("ok", data)
                     messagebox.showinfo(APP_TITLE, data)
 
                 elif event == "addons_cancelled":
@@ -3450,6 +3616,7 @@ class BackupApp:
                     self._btn_sync_addons.config(state="normal")
                     self._set_status_op("Detenido", color="#888888")
                     self._end_operation()
+                    self._history_end("cancelled", data)
                     messagebox.showwarning(APP_TITLE, data)
 
                 elif event == "btn_addons_enable":
@@ -3470,6 +3637,9 @@ class BackupApp:
 
     def _append_log(self, msg: str) -> None:
         """Append a color-coded, timestamped line to the log panel (GUI thread only)."""
+        if self._current_op_meta is not None:
+            self._current_op_log.append(msg)
+
         ts = datetime.datetime.now().strftime("%H:%M:%S")
 
         # ── Line-level tag selection ───────────────────────────────────────
@@ -4144,6 +4314,11 @@ class BackupApp:
         self._v_r_progress.set(0)
         self._lbl_r_progress.config(text="")
         self._begin_operation()
+        self._history_begin(
+            "restore",
+            self._server_label_for(self._cb_r_profile.get(), ssh.host),
+            ssh.host or "",
+        )
 
         # Safe int conversion — already validated by _validate_restore_params
         try:
@@ -4710,38 +4885,57 @@ class BackupApp:
         sec4.columnconfigure(1, weight=1)
         row += 1
 
-        ttk.Checkbutton(
-            sec4,
-            text="Reiniciar servicio Odoo al terminar la sincronizacion",
-            variable=self._v_a_restart,
-            command=self._toggle_addons_restart,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-
+        # Service name is always enabled now — it's shared between "reiniciar
+        # servicio" (below) and the automatic `-u` database update (see
+        # _worker_addons), which needs it even when a restart isn't requested.
         ttk.Label(sec4, text="Nombre del servicio:").grid(
-            row=1, column=0, sticky="e", padx=(0, _PAD), pady=3
+            row=0, column=0, sticky="e", padx=(0, _PAD), pady=3
         )
         svc_row = ttk.Frame(sec4)
-        svc_row.grid(row=1, column=1, sticky="ew", pady=3)
+        svc_row.grid(row=0, column=1, sticky="ew", pady=3)
         svc_row.columnconfigure(0, weight=1)
 
-        self._e_a_service = ttk.Entry(svc_row, textvariable=self._v_a_service, state="disabled")
+        self._e_a_service = ttk.Entry(svc_row, textvariable=self._v_a_service)
         self._e_a_service.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self._btn_detect_svc = ttk.Button(
-            svc_row, text="Auto-detectar", state="disabled",
+            svc_row, text="Auto-detectar",
             command=self._action_detect_service,
         )
         self._btn_detect_svc.grid(row=0, column=1)
 
+        ttk.Label(sec4, text="Base(s) de datos:").grid(
+            row=1, column=0, sticky="e", padx=(0, _PAD), pady=3
+        )
+        ttk.Entry(sec4, textvariable=self._v_a_db_name).grid(
+            row=1, column=1, sticky="ew", pady=3
+        )
+        tk.Label(
+            sec4,
+            text="  Si hay modulos con cambios tras el sync, se ofrece actualizarlas "
+                 "(-u) antes de reiniciar — usa el binario/conf del servicio de arriba. "
+                 "Varias bases separadas por coma (ej: limatec_test, limatec_prod) se "
+                 "actualizan una por una, nunca en paralelo — si una falla, se detiene "
+                 "ahi y no continua con las siguientes. Dejar vacio para omitir este paso.",
+            font=("Segoe UI", 8), fg="#666666", bg=_C_BG,
+            wraplength=480, justify="left",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        ttk.Checkbutton(
+            sec4,
+            text="Reiniciar servicio Odoo al terminar la sincronizacion",
+            variable=self._v_a_restart,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
         ttk.Separator(sec4, orient="horizontal").grid(
-            row=2, column=0, columnspan=3, sticky="ew", pady=6
+            row=4, column=0, columnspan=3, sticky="ew", pady=6
         )
 
         ttk.Checkbutton(
             sec4,
             text="Modo espejo forzado (el repositorio SIEMPRE gana, nunca mezcla)",
             variable=self._v_a_force_mirror,
-        ).grid(row=3, column=0, columnspan=3, sticky="w")
+        ).grid(row=5, column=0, columnspan=3, sticky="w")
         tk.Label(
             sec4,
             text="  Descarta cualquier cambio local en el servidor (git reset --hard + "
@@ -4750,7 +4944,7 @@ class BackupApp:
                  "identica al repositorio remoto — irreversible.",
             font=("Segoe UI", 8), fg="#E67E22", bg=_C_BG,
             wraplength=480, justify="left",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 2))
 
         # ── Seccion 5: Progreso y ejecucion ──────────────────────────────
         sec5 = ttk.LabelFrame(f, text="5. Ejecucion", padding=_PAD)
@@ -4779,9 +4973,6 @@ class BackupApp:
             style="Stop.TButton", command=self._action_stop,
         )
         self._btn_stop_addons.pack(side="left", padx=6)
-
-        # Apply initial state for the restart option
-        self._toggle_addons_restart()
 
     # ── Addons: helpers ───────────────────────────────────────────────────
 
@@ -4936,11 +5127,15 @@ class BackupApp:
                 current.insert(0, path)
                 self._cb_a_ssh_key["values"] = current
 
-    def _toggle_addons_restart(self) -> None:
-        """Enable/disable the service name entry and auto-detect button."""
-        state = "normal" if self._v_a_restart.get() else "disabled"
-        self._e_a_service.config(state=state)
-        self._btn_detect_svc.config(state=state)
+    # Removed: the service name entry/button are now always enabled — the
+    # `-u` database update step (see _worker_addons) needs the service name
+    # to resolve the odoo binary/conf even when "reiniciar servicio" isn't
+    # checked, so gating them on that checkbox no longer made sense.
+    # def _toggle_addons_restart(self) -> None:
+    #     """Enable/disable the service name entry and auto-detect button."""
+    #     state = "normal" if self._v_a_restart.get() else "disabled"
+    #     self._e_a_service.config(state=state)
+    #     self._btn_detect_svc.config(state=state)
 
     def _get_key_passphrase(self, key_path: str) -> str | None:
         """
@@ -5116,6 +5311,15 @@ class BackupApp:
         self._v_a_progress.set(0)
         self._lbl_a_progress.config(text="")
         self._begin_operation()
+        profile_combo = (
+            self._cb_profile.get() if self._v_a_conn_type.get() == "origin"
+            else self._cb_r_profile.get()
+        )
+        self._history_begin(
+            "addons_sync",
+            self._server_label_for(profile_combo, ssh.host),
+            ssh.host or "",
+        )
 
         params = {
             "repo_url":       repo_url,
@@ -5131,6 +5335,7 @@ class BackupApp:
             "force_mirror":   self._v_a_force_mirror.get(),
             "restart":        self._v_a_restart.get(),
             "service":        self._v_a_service.get().strip(),
+            "db_name":        self._v_a_db_name.get().strip(),
         }
         threading.Thread(
             target=self._worker_addons, args=(params, ssh), daemon=True
@@ -5149,8 +5354,6 @@ class BackupApp:
         # Track whether we uploaded a key file (True) or only wrote a wrapper (False)
         key_uploaded = False
         wrapper_written = False
-        agent_started = False
-        env_prefix = ""
 
         try:
             # Step 1: verify git on the server
@@ -5171,10 +5374,9 @@ class BackupApp:
                 # read the (still encrypted) key file directly.
                 if p.get("server_passphrase"):
                     self._q.put(("addons_progress", (25, "Desbloqueando llave del servidor...")))
-                    env_prefix = mgr.unlock_server_key(
+                    mgr.unlock_server_key(
                         p["server_key"], p["server_passphrase"], log_callback=self._log,
                     )
-                    agent_started = True
 
             elif p["key_source"] == "local":
                 self._q.put(("addons_progress", (20, "Subiendo llave SSH temporal...")))
@@ -5185,6 +5387,37 @@ class BackupApp:
                 )
                 key_uploaded = True
                 wrapper_written = True
+
+            # Step 2.5: detect submodules removed upstream but still
+            # registered in THIS checkout's local .git/config (see
+            # AddonsManager.detect_stale_submodules's docstring) — confirm
+            # with the user before touching anything, same as every other
+            # local-state-changing action in the app.
+            if p["use_submodules"]:
+                stale = mgr.detect_stale_submodules(p["target"])
+                if stale:
+                    names_list = "\n".join(f"  • {n}" for n in stale)
+                    proceed = self._ask_confirm(
+                        "Submodulos huerfanos detectados",
+                        "Los siguientes submodulos ya no existen en el repositorio "
+                        "remoto, pero siguen registrados localmente en este checkout "
+                        "(se retiraron del repo despues de que este servidor ya "
+                        f"tenia una copia local):\n\n{names_list}\n\n"
+                        "¿Retirar su registro local? Es necesario para continuar "
+                        "la sincronizacion de submodulos — no contacta GitHub ni "
+                        "modifica el repositorio remoto, solo limpia este checkout.",
+                    )
+                    if not proceed:
+                        self._q.put(("addons_cancelled",
+                            "Sincronizacion cancelada — submodulos huerfanos sin resolver."))
+                        return
+                    mgr.deinit_submodules(p["target"], stale, log_callback=self._log)
+
+            # Snapshot "before" state so we can tell which modules actually
+            # changed once the sync lands — see diff_changed_modules(). None/
+            # empty on a first clone (nothing was "updated" yet).
+            before_head = mgr.get_head_commit(p["target"])
+            before_subs = mgr.get_submodule_status(p["target"])
 
             # Step 3: clone or pull (with optional submodule sequence)
             label = (
@@ -5201,10 +5434,66 @@ class BackupApp:
                 use_submodules=p["use_submodules"],
                 force_mirror=p["force_mirror"],
                 log_callback=self._log,
-                env_prefix=env_prefix,
                 cancel_event=self._cancel_event,
             )
             self._q.put(("addons_progress", (80, "Repositorio sincronizado.")))
+
+            # Step 3.5: if module code actually changed, offer to update the
+            # database(s) before restarting — a git sync alone never applies
+            # new fields/views/data/migrations, only `-u` does. Multiple
+            # databases (comma-separated) update ONE AT A TIME, never in
+            # parallel — each -u is heavy (locks tables, real CPU/IO), and
+            # running several against the same Postgres server at once risks
+            # contention or lock collisions if they share anything. If one
+            # fails, the loop stops there rather than continuing to the rest,
+            # so a partial failure never gets masked by "later ones worked".
+            db_names = [d.strip() for d in p["db_name"].split(",") if d.strip()]
+            if not db_names:
+                self._log(
+                    "Actualizacion de base de datos omitida: no se indico "
+                    "ninguna base de datos en el Tab 7 (campo 'Base(s) de datos')."
+                )
+            elif not p["service"]:
+                self._log(
+                    "Actualizacion de base de datos omitida: no hay un "
+                    "servicio configurado (necesario para resolver el binario/conf de Odoo)."
+                )
+            else:
+                self._log("Verificando modulos con cambios desde el ultimo sync...")
+                after_head = mgr.get_head_commit(p["target"])
+                after_subs = mgr.get_submodule_status(p["target"])
+                changed = mgr.diff_changed_modules(
+                    p["target"], before_head, after_head, before_subs, after_subs,
+                )
+                if not changed:
+                    self._log(
+                        "No se detectaron modulos con cambios en esta sincronizacion "
+                        f"— se omite la actualizacion de {', '.join(db_names)}."
+                    )
+                else:
+                    names_list = "\n".join(f"  • {n}" for n in changed)
+                    dbs_list = "\n".join(f"  • {d}" for d in db_names)
+                    proceed = self._ask_confirm(
+                        "Modulos modificados detectados",
+                        f"Se detectaron {len(changed)} modulo(s) con cambios en esta "
+                        f"sincronizacion:\n\n{names_list}\n\n"
+                        f"¿Actualizar estas base(s) de datos con estos cambios (-u), "
+                        f"una por una?\n\n{dbs_list}\n\n"
+                        "Puede tardar varios minutos por cada una.",
+                    )
+                    if proceed:
+                        binary, conf_path = mgr.resolve_service_launcher(p["service"])
+                        for i, db in enumerate(db_names, 1):
+                            self._q.put(("addons_progress",
+                                (85, f"Actualizando '{db}' ({i}/{len(db_names)})...")))
+                            mgr.update_db_modules(
+                                db, changed, conf_path, binary,
+                                odoo_user=p["odoo_user"],
+                                log_callback=self._log,
+                                cancel_event=self._cancel_event,
+                            )
+                    else:
+                        self._log("Actualizacion de base de datos omitida por el usuario.")
 
             # Step 4: optional service restart
             if p["restart"] and p["service"]:
@@ -5228,8 +5517,6 @@ class BackupApp:
             # Remove temp files — only delete the key file if we uploaded one
             if wrapper_written:
                 mgr.cleanup_key(uploaded=key_uploaded)
-            if agent_started:
-                mgr.stop_agent()
 
     def _action_detect_service(self) -> None:
         """Auto-detect the Odoo systemd service name on the selected server."""
@@ -5794,12 +6081,14 @@ class BackupApp:
             get_ssh=_get_ssh_left,
             title="Servidor Origen  (Tab 1)",
             on_status=_on_status,
+            on_session_end=self._on_terminal_session_end,
         )
         term_r = SshTerminalPanel(
             paned,
             get_ssh=_get_ssh_right,
             title="Servidor B / Restauracion  (Tab 1 / Tab 4)",
             on_status=_on_status,
+            on_session_end=self._on_terminal_session_end,
         )
 
         paned.add(term_l, weight=1)
@@ -6169,3 +6458,142 @@ class BackupApp:
             )
             return
         self._sched_append_log(f"[{label}] Ejecucion manual iniciada...")
+
+    # ── Tab Historial ──────────────────────────────────────────────────────
+
+    def _tab_history(self) -> None:
+        """
+        Tab Historial: persistent, cross-restart log of every backup/restore/
+        addons-sync (manual or scheduled) and terminal session — see
+        core/history_manager.py. Unlike self.log_widget (cleared on every app
+        close by design), this survives closing the app so a client's
+        activity can be audited later.
+        """
+        outer = ttk.Frame(self.nb, padding=_PAD)
+        self.nb.add(outer, text="  Historial  ")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        # ── Filter bar ──────────────────────────────────────────────────────
+        bar = ttk.Frame(outer)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        ttk.Label(bar, text="Tipo:").pack(side="left", padx=(0, 4))
+        self._v_hist_filter = tk.StringVar(value="Todos")
+        cb = ttk.Combobox(
+            bar,
+            textvariable=self._v_hist_filter,
+            values=["Todos"] + list(_HISTORY_TYPE_LABELS.keys()),
+            state="readonly",
+            width=20,
+        )
+        cb.pack(side="left", padx=(0, 12))
+        cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_history_tree())
+
+        ttk.Button(
+            bar, text="Actualizar", command=self._refresh_history_tree,
+        ).pack(side="left")
+        ttk.Button(
+            bar, text="Ver detalle", command=self._history_show_detail,
+        ).pack(side="left", padx=(4, 0))
+
+        # ── Tree ──────────────────────────────────────────────────────────
+        lf = ttk.LabelFrame(outer, text="Conexiones y acciones registradas", padding=_PAD)
+        lf.grid(row=1, column=0, sticky="nsew")
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+
+        cols = ("Fecha", "Tipo", "Servidor", "Resultado", "Resumen")
+        self._hist_tree = ttk.Treeview(
+            lf, columns=cols, show="headings", height=18, selectmode="browse",
+        )
+        for col, w in zip(cols, (140, 130, 160, 90, 380)):
+            self._hist_tree.heading(col, text=col)
+            self._hist_tree.column(col, width=w, anchor="w")
+        self._hist_tree.grid(row=0, column=0, sticky="nsew")
+
+        vsb = ttk.Scrollbar(lf, orient="vertical", command=self._hist_tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._hist_tree.configure(yscrollcommand=vsb.set)
+
+        self._hist_tree.tag_configure("ok",        foreground="#2E8B57")
+        self._hist_tree.tag_configure("error",     foreground="#C0392B")
+        self._hist_tree.tag_configure("cancelled", foreground="#888888")
+        self._hist_tree.tag_configure("warning",   foreground="#E67E22")
+
+        self._hist_tree.bind("<Double-1>", lambda e: self._history_show_detail())
+
+        # Cache of entries currently shown in the tree, keyed by Treeview iid,
+        # so "Ver detalle" can find the full log text without re-reading disk.
+        self._hist_entries_by_iid: dict[str, dict] = {}
+
+        self._refresh_history_tree()
+
+    def _refresh_history_tree(self) -> None:
+        """Reload the history table from disk, applying the current filter."""
+        tree = getattr(self, "_hist_tree", None)
+        if tree is None:
+            return
+        children = tree.get_children()
+        if children:
+            tree.delete(*children)
+        self._hist_entries_by_iid = {}
+
+        filt = self._v_hist_filter.get()
+        for i, entry in enumerate(self._history.list_entries(limit=500)):
+            if filt != "Todos" and entry.get("action_type") != filt:
+                continue
+            iid = entry.get("id") or str(i)
+            self._hist_entries_by_iid[iid] = entry
+
+            ended_at = entry.get("ended_at")
+            ts = (
+                datetime.datetime.fromtimestamp(ended_at).strftime("%Y-%m-%d %H:%M:%S")
+                if ended_at else "—"
+            )
+            type_label = _HISTORY_TYPE_LABELS.get(
+                entry.get("action_type", ""), entry.get("action_type", "")
+            )
+            status = entry.get("status", "")
+            server = entry.get("server_label") or entry.get("host") or "—"
+            summary = (entry.get("summary") or "")[:150]
+
+            tree.insert(
+                "", "end", iid=iid,
+                values=(ts, type_label, server, status, summary),
+                tags=(status,) if status in ("ok", "error", "cancelled", "warning") else (),
+            )
+
+    def _history_show_detail(self) -> None:
+        """Open a window with the full captured log for the selected history row."""
+        tree = getattr(self, "_hist_tree", None)
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "Seleccione una fila del historial primero.")
+            return
+        entry = self._hist_entries_by_iid.get(sel[0])
+        if not entry:
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title(f"Detalle — {entry.get('server_label', '')}")
+        top.geometry("800x500")
+
+        type_label = _HISTORY_TYPE_LABELS.get(
+            entry.get("action_type", ""), entry.get("action_type", "")
+        )
+        header = (
+            f"Tipo: {type_label}\n"
+            f"Servidor: {entry.get('server_label', '')}  ({entry.get('host', '')})\n"
+            f"Resultado: {entry.get('status', '')}\n"
+            f"Resumen: {entry.get('summary', '')}\n"
+            f"{'-' * 80}\n"
+        )
+        txt = tk.Text(top, wrap="word")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("end", header + (entry.get("log") or "(sin log detallado)"))
+        txt.config(state="disabled")
+
+        ttk.Button(top, text="Cerrar", command=top.destroy).pack(pady=(0, 8))

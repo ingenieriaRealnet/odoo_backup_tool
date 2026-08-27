@@ -11,3 +11,6 @@ google-auth-httplib2>=0.1.0
 
 # Desktop notifications (scheduler / Tab Automatizacion)
 plyer>=2.1.0
+
+# Drag-and-drop desde el explorador de archivos del SO (Tab 8)
+tkinterdnd2>=0.4.2

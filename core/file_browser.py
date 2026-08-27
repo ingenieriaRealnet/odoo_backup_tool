@@ -21,8 +21,11 @@ Notes:
 from __future__ import annotations
 
 import datetime
+import os
 import posixpath
+import shutil
 import stat
+import tempfile
 import time
 from typing import Callable
 
@@ -390,3 +393,61 @@ class RemoteBrowser:
         finally:
             # Always clean up the temporary zip from the server
             self._ssh.execute(f"rm -f {remote_zip}")
+
+    def upload_dir(
+        self,
+        local_path: str,
+        remote_parent: str,
+        progress_callback=None,
+    ) -> None:
+        """
+        Compress a local directory into a .zip, upload it, and extract it
+        into remote_parent on the server — the inverse of
+        download_dir_as_zip(). The directory's own name is preserved as the
+        top-level folder inside remote_parent (mirrors how download_dir_as_zip
+        keeps the folder name as the zip's root entry).
+
+        Used by the Explorer tab's (Tab 8) drag-and-drop: dropping a local
+        folder onto a remote panel uploads its full contents recursively.
+
+        Args:
+            local_path:    Local filesystem path of the directory to upload.
+            remote_parent: Remote directory that will contain the uploaded folder.
+            progress_callback: Optional SFTP progress callback(bytes_done, total)
+                               for the zip upload step (extraction has no
+                               granular progress — `unzip` runs as one command).
+
+        Raises:
+            RuntimeError: If the remote extraction fails.
+        """
+        local_path = local_path.rstrip("/\\")
+        basename   = os.path.basename(local_path)
+        ts         = int(time.time())
+        local_zip  = os.path.join(tempfile.gettempdir(), f"obt_ul_{basename}_{ts}.zip")
+        remote_zip = f"/tmp/obt_ul_{basename}_{ts}.zip"
+
+        # shutil.make_archive appends ".zip" itself, so pass the base path
+        # without the extension.
+        archive_base = local_zip[:-4]
+        shutil.make_archive(
+            archive_base, "zip",
+            root_dir=os.path.dirname(local_path), base_dir=basename,
+        )
+
+        try:
+            self.upload_file(local_zip, remote_zip, progress_callback)
+            code, _, err = self._ssh.execute(
+                f"mkdir -p {remote_parent} && cd {remote_parent} && "
+                f"unzip -o {remote_zip} 2>&1"
+            )
+            if code != 0:
+                raise RuntimeError(
+                    f"Error al descomprimir '{basename}' en el servidor:\n{err}"
+                )
+        finally:
+            # Always clean up both the remote and local temporary zips
+            self._ssh.execute(f"rm -f {remote_zip}")
+            try:
+                os.remove(local_zip)
+            except OSError:
+                pass
