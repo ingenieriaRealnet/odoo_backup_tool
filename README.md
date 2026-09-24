@@ -55,6 +55,7 @@ Herramienta de escritorio para **respaldar, restaurar y administrar instancias O
 - Comandos disponibles en el servidor: `pg_dump`, `pg_restore`, `psql`, `zip`, `unzip`
 - Para transferencia servidor-a-servidor: `sshpass` en el servidor origen
 - Para sincronización de addons: `git` en el servidor destino
+- **Opcional (Docker):** si PostgreSQL/Odoo corren en contenedores en vez de bare-metal, el usuario SSH necesita poder ejecutar `docker` (directo o con `sudo`) — ver Tab 2 / Tab Trial
 
 ---
 
@@ -156,6 +157,9 @@ Al seleccionar un perfil en cualquier combobox de perfiles, los datos de conexi�
   - `.dump` — formato binario custom de `pg_dump -Fc` (recomendado): permite restauración paralela con múltiples workers (`pg_restore -j N`)
   - `.sql` — texto plano: compatible con `psql`, más portátil pero mayor tamaño y restauración más lenta
 - Botón "Siguiente →" con validación (no avanza si no hay BD seleccionada)
+- **Docker (opcional):** si PostgreSQL corre dentro de un contenedor en vez de bare-metal en el servidor, campo **"Contenedor"** + botón **"Detectar contenedores"** (usa `docker ps`/`docker inspect` por SSH para listar contenedores con imagen Postgres y su usuario). Vacío = comportamiento bare-metal de siempre (`sudo -u postgres psql`); con contenedor seleccionado, todas las operaciones de esta pestaña (listar BDs, `pg_dump`) se ejecutan vía `docker exec`. El valor se guarda como parte del perfil de servidor.
+  - **Limitación conocida:** "Detectar contenedores" solo encuentra contenedores cuya imagen contiene `postgres` o que publican el puerto 5432 — un despliegue "todo en uno" (Odoo + Postgres embebidos en el mismo contenedor, ej. `ecoerp-demo` en el servidor de pruebas) no aparece en la detección automática. El campo "Contenedor" es editable: escriba el nombre del contenedor manualmente en ese caso (y ajuste el usuario Postgres si no es `postgres`/`odoo`).
+  - **Campo "Usuario OS (peer auth)":** algunos despliegues "todo en uno" configuran `pg_hba.conf` con autenticación `peer`, que exige que el usuario del sistema operativo del `docker exec` coincida con el rol de Postgres (confirmado en `ecoerp-demo`: `psql -U odoo` falla con "Peer authentication failed", pero `docker exec -u postgres ecoerp-demo psql ...` sí funciona). Si "Contenedor" solo no basta (error de autenticación), complete este campo con el usuario de SO correcto (ej. `postgres`) — la herramienta entonces usa `docker exec -u <usuario>` y omite `-U` explícito. Vacío = caso normal (imagen oficial de Postgres, auth trust/md5).
 
 ---
 
@@ -395,6 +399,8 @@ Los valores obtenidos se muestran en una tabla (clave, valor, create_date, write
 - Botón **"Consultar BD objetivo"**: muestra los valores `database.*` actuales de la BD seleccionada
 - Botón **"Aplicar valores Trial"** (con confirmación): ejecuta los `UPDATE` en `database.secret`, `database.uuid`, `database.create_date`, y elimina `database.expiration_date` y `database.expiration_reason`
 
+**Docker (opcional):** igual que en Tab 2, la sección "Servidor" tiene un campo **"Contenedor"** + botón **"Detectar contenedores"**. Si se selecciona un contenedor, todas las operaciones de esta pestaña (listar BDs, crear/eliminar BD temporal, consultar y **aplicar** los `UPDATE`/`DELETE` de licencia) se ejecutan vía `docker exec` dentro del contenedor en vez de `sudo -u postgres` en el host. Se autocompleta con el `docker_container` guardado en el perfil de "Servidor B" (Tab 6) si aplica.
+
 ---
 
 ## 6. Sistema de perfiles de servidor
@@ -408,10 +414,13 @@ Los perfiles se almacenan en `~/.odoo_backup_tool/servers.json` y se comparten e
     "host": "192.168.1.10",
     "port": 22,
     "user": "root",
-    "password": "mi_contraseña"
+    "password": "mi_contraseña",
+    "docker_container": ""
   }
 ]
 ```
+
+`docker_container` es opcional: vacío (default, retrocompatible con perfiles guardados antes de esta función) significa PostgreSQL bare-metal; con un nombre de contenedor, Tab 2 y Tab Trial ejecutan sus operaciones vía `docker exec` en ese contenedor (ver secciones respectivas). El scheduler de automatización también lo respeta al generar dumps de reglas programadas.
 
 > **Seguridad:** Las contraseñas se almacenan en **texto plano**. Este archivo debe protegerse con permisos restrictivos en el sistema operativo y nunca subirse a control de versiones.
 

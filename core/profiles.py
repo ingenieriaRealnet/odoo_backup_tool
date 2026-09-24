@@ -33,6 +33,10 @@ class ProfileManager:
         password (str)         — SSH password (plain text)
         gdrive_creds_path (str)  — optional: absolute path to Service Account JSON
         gdrive_folder_id (str)   — optional: Google Drive folder or Shared Drive ID
+        docker_container (str)   — optional: nombre del contenedor Docker con
+                                   PostgreSQL; vacio = Postgres bare-metal (default)
+        docker_exec_user (str)   — optional: usuario de SO para 'docker exec -u'
+                                   (autenticacion peer); vacio = caso normal (default)
     """
 
     def __init__(self) -> None:
@@ -97,6 +101,8 @@ class ProfileManager:
                     # Back-fill Drive fields for older profiles that lack them
                     result.setdefault("gdrive_creds_path", "")
                     result.setdefault("gdrive_folder_id", "")
+                    result.setdefault("docker_container", "")
+                    result.setdefault("docker_exec_user", "")
                     return result
         return None
 
@@ -109,6 +115,8 @@ class ProfileManager:
         password: str,
         gdrive_creds_path: str = "",
         gdrive_folder_id: str = "",
+        docker_container: str = "",
+        docker_exec_user: str = "",
     ) -> None:
         """
         Save (create or update) a profile with the given name.
@@ -123,6 +131,10 @@ class ProfileManager:
             password:           SSH password.
             gdrive_creds_path:  Optional path to Google Service Account JSON.
             gdrive_folder_id:   Optional Drive folder or Shared Drive ID.
+            docker_container:   Optional nombre del contenedor Docker con
+                                PostgreSQL (vacio = Postgres bare-metal).
+            docker_exec_user:   Optional usuario de SO para 'docker exec -u'
+                                (autenticacion peer; vacio = caso normal).
 
         Raises:
             ValueError: If name or host is empty.
@@ -142,6 +154,8 @@ class ProfileManager:
             "password":           password,
             "gdrive_creds_path":  gdrive_creds_path.strip(),
             "gdrive_folder_id":   gdrive_folder_id.strip(),
+            "docker_container":   docker_container.strip(),
+            "docker_exec_user":   docker_exec_user.strip(),
         }
 
         with self._lock:

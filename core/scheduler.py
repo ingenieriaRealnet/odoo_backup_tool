@@ -515,6 +515,7 @@ class BackupScheduler:
         from .db_manager        import DBManager
         from .filestore_manager import FilestoreManager
         from .transfer          import TransferManager
+        from .pg_exec           import PgTarget
 
         rule_id = rule["id"]
         label   = rule.get("label") or rule.get("db_name", rule_id[:8])
@@ -586,7 +587,11 @@ class BackupScheduler:
             if entry_id:
                 self._temp_registry.unregister(entry_id)
 
-        db_mgr = DBManager(ssh)
+        pg_target = PgTarget(
+            container=profile.get("docker_container", ""),
+            docker_exec_user=profile.get("docker_exec_user", ""),
+        )
+        db_mgr = DBManager(ssh, target=pg_target)
         fs_mgr = FilestoreManager(ssh)
         tm     = TransferManager(ssh)
 

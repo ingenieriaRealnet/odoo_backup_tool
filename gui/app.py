@@ -20,6 +20,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from core.addons_manager import AddonsManager, scan_ssh_directory
 from core.file_browser import RemoteBrowser
 from core.db_manager import DBManager
+from core.docker_manager import DockerManager
+from core.pg_exec import PgTarget
 from core.gdrive import DriveUploader
 from core.inventory_manager import InventoryManager
 from core.filestore_manager import FilestoreManager
@@ -535,6 +537,15 @@ class BackupApp:
         # SSH client for the backup destination server (Step 4 "otro servidor remoto")
         self._ssh_dest = SSHClient()
 
+        # Objetivo de PostgreSQL (bare-metal o contenedor Docker) para el
+        # servidor de origen (Tab 2) y para el servidor usado en Tab Trial.
+        # Se completan automaticamente con el perfil conectado y pueden
+        # ajustarse manualmente en la UI ("Contenedor:" + "Detectar").
+        self._pg_target_source = PgTarget()
+        self._pg_target_trial  = PgTarget()
+        self._docker_pg_users_source: dict[str, str] = {}
+        self._docker_pg_users_trial:  dict[str, str] = {}
+
         # Persistent connection profiles (loaded from ~/.odoo_backup_tool/servers.json)
         self._profiles = ProfileManager()
 
@@ -570,6 +581,8 @@ class BackupApp:
         # ── Backup state variables ────────────────────────────────────────
         self._v_db = tk.StringVar()
         self._v_dump_fmt = tk.StringVar(value="dump")
+        self._v_docker_container = tk.StringVar()  # Tab 2: contenedor Postgres (vacio = bare-metal)
+        self._v_docker_exec_user = tk.StringVar()  # Tab 2: usuario OS para 'docker exec -u' (auth peer, opcional)
         self._v_fs_root = tk.StringVar()
         self._v_fs_db = tk.StringVar()
         self._v_dest_type = tk.StringVar(value="local")
@@ -1483,7 +1496,7 @@ class BackupApp:
         ):
             return
 
-        db_mgr = DBManager(self._ssh)
+        db_mgr = DBManager(self._ssh, target=self._pg_target_source)
         src_host = self._retry_conn_params.get("src_host", self._ssh.host)
         for path in self._retry_remote_tmp:
             try:
@@ -1790,9 +1803,71 @@ class BackupApp:
             fmt_f, text=".sql   —  texto plano", variable=self._v_dump_fmt, value="sql"
         ).pack(anchor="w")
 
+        # ── Docker (opcional) — BD dentro de un contenedor en vez de bare-metal ──
+        lf_docker = ttk.LabelFrame(f, text="Docker (opcional)", padding=6)
+        lf_docker.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(_PAD, 0))
+        lf_docker.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            lf_docker,
+            text="Vacio = PostgreSQL directo en el servidor. Complete solo si la BD "
+                 "vive dentro de un contenedor Docker.",
+            foreground="#666666", font=("Segoe UI", 8), wraplength=420,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        ttk.Label(lf_docker, text="Contenedor:").grid(row=1, column=0, sticky="e", padx=(0, _PAD))
+        self._cb_docker_container = ttk.Combobox(lf_docker, textvariable=self._v_docker_container)
+        self._cb_docker_container.grid(row=1, column=1, sticky="ew", padx=(0, _PAD))
+        ttk.Button(
+            lf_docker, text="Detectar contenedores", command=self._action_detect_docker_source,
+        ).grid(row=1, column=2)
+
+        ttk.Label(lf_docker, text="Usuario OS (peer auth):").grid(
+            row=2, column=0, sticky="e", padx=(0, _PAD), pady=(4, 0))
+        ttk.Entry(lf_docker, textvariable=self._v_docker_exec_user).grid(
+            row=2, column=1, sticky="w", padx=(0, _PAD), pady=(4, 0))
+        ttk.Label(
+            lf_docker,
+            text="Solo si el contenedor exige 'docker exec -u <usuario>' (autenticacion peer, "
+                 "ej. despliegues \"todo en uno\"). Dejar vacio para el caso normal.",
+            foreground="#666666", font=("Segoe UI", 8), wraplength=420,
+        ).grid(row=3, column=0, columnspan=3, sticky="w")
+
+        def _sync_pg_target_source(*_):
+            container = self._v_docker_container.get().strip()
+            self._pg_target_source.container = container
+            self._pg_target_source.pg_user = self._docker_pg_users_source.get(container, "postgres")
+            self._pg_target_source.docker_exec_user = self._v_docker_exec_user.get().strip()
+        self._v_docker_container.trace_add("write", _sync_pg_target_source)
+        self._v_docker_exec_user.trace_add("write", _sync_pg_target_source)
+
         ttk.Button(f, text="Siguiente ->", style="Nav.TButton", command=self._goto_filestore).grid(
             row=8, column=0, columnspan=3, pady=_PAD * 2
         )
+
+    def _action_detect_docker_source(self) -> None:
+        """Tab 2: detecta contenedores Postgres en el servidor origen (Tab 1)."""
+        if not self._ssh.connected:
+            self._log("[ERROR] Docker: conectese primero en Tab 1.")
+            return
+        self._log("Docker — detectando contenedores Postgres ...")
+
+        def _run():
+            try:
+                containers = DockerManager(self._ssh).list_postgres_containers()
+                def _fill():
+                    names = [c["name"] for c in containers]
+                    self._cb_docker_container["values"] = names
+                    self._docker_pg_users_source = {c["name"]: c["pg_user"] for c in containers}
+                    if not names:
+                        self._log("  No se encontraron contenedores Postgres (o Docker no esta disponible).")
+                    for c in containers:
+                        self._log(f"  {c['name']}  ({c['image']})  usuario pg: {c['pg_user']}  {c['ports']}")
+                self.root.after(0, _fill)
+            except Exception as exc:
+                self.root.after(0, lambda: self._log(f"[ERROR] Docker — detectar: {exc}"))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── Tab 3: Filestore ─────────────────────────────────────────────────
 
@@ -2274,6 +2349,8 @@ class BackupApp:
             self._cv["pass"].set(p["password"])
             self._v_prof_gdrive_creds.set(p.get("gdrive_creds_path", ""))
             self._v_prof_gdrive_folder.set(p.get("gdrive_folder_id", ""))
+            self._v_docker_container.set(p.get("docker_container", ""))
+            self._v_docker_exec_user.set(p.get("docker_exec_user", ""))
 
     def _save_profile(self) -> None:
         """Save current Tab-1 connection fields as a named profile.
@@ -2313,6 +2390,8 @@ class BackupApp:
                 password=self._cv["pass"].get(),
                 gdrive_creds_path=self._v_prof_gdrive_creds.get(),
                 gdrive_folder_id=self._v_prof_gdrive_folder.get(),
+                docker_container=self._v_docker_container.get(),
+                docker_exec_user=self._v_docker_exec_user.get(),
             )
             self._refresh_profile_combos()
             self._cb_profile.set(name)
@@ -2408,6 +2487,12 @@ class BackupApp:
             self._r_conn_vars["port"].set(str(p["port"]))
             self._r_conn_vars["user"].set(p["user"])
             self._r_conn_vars["pass"].set(p["password"])
+            trial_container_var = getattr(self, "_v_trial_container", None)
+            if trial_container_var is not None:
+                trial_container_var.set(p.get("docker_container", ""))
+            trial_exec_user_var = getattr(self, "_v_trial_exec_user", None)
+            if trial_exec_user_var is not None:
+                trial_exec_user_var.set(p.get("docker_exec_user", ""))
 
     def _save_r_profile(self) -> None:
         """Save current restore 'otro servidor' fields as a named profile.
@@ -2445,6 +2530,8 @@ class BackupApp:
                 port=int(self._r_conn_vars["port"].get() or 22),
                 user=self._r_conn_vars["user"].get(),
                 password=self._r_conn_vars["pass"].get(),
+                docker_container=getattr(self, "_v_trial_container", tk.StringVar()).get(),
+                docker_exec_user=getattr(self, "_v_trial_exec_user", tk.StringVar()).get(),
             )
             self._refresh_profile_combos()
             self._cb_r_profile.set(name)
@@ -2758,7 +2845,7 @@ class BackupApp:
     def _action_load_dbs(self) -> None:
         def _run():
             try:
-                dbs = DBManager(self._ssh).list_databases()
+                dbs = DBManager(self._ssh, target=self._pg_target_source).list_databases()
                 self._q.put(("db_list", dbs))
             except Exception as exc:
                 self._q.put(("error", f"Error cargando bases de datos: {exc}"))
@@ -2865,7 +2952,7 @@ class BackupApp:
 
     def _worker_backup(self, p: dict) -> None:
         """Orchestrates DB dump, filestore compression and file transfer."""
-        db_mgr = DBManager(self._ssh)
+        db_mgr = DBManager(self._ssh, target=self._pg_target_source)
         fs_mgr = FilestoreManager(self._ssh)
         transfer = TransferManager(self._ssh)
 
@@ -3010,7 +3097,7 @@ class BackupApp:
                 _register(bundle_path_remote, "bundle")
 
                 # Remove individual files — they are now inside the .tar
-                db_mgr_cleanup = DBManager(self._ssh)
+                db_mgr_cleanup = DBManager(self._ssh, target=self._pg_target_source)
                 for f in all_files:
                     db_mgr_cleanup.cleanup_remote(f)
                     _unregister(f)
@@ -3079,7 +3166,7 @@ class BackupApp:
                 that didn't build their own closure (the retry flow) still
                 get correct cleanup tracking.
         """
-        db_mgr   = DBManager(self._ssh)
+        db_mgr   = DBManager(self._ssh, target=self._pg_target_source)
         transfer = TransferManager(self._ssh)
 
         if unregister_fn is None:
@@ -5695,6 +5782,57 @@ class BackupApp:
         ttk.Button(lf_srv, text="Probar conexion", command=_test_conn).grid(
             row=0, column=2, padx=(4, 0))
 
+        # ── Docker (opcional) — BD dentro de un contenedor en vez de bare-metal ──
+        ttk.Label(lf_srv, text="Contenedor:").grid(row=1, column=0, sticky="e", padx=(0, _PAD), pady=(6, 0))
+        self._v_trial_container = tk.StringVar()
+        cb_trial_container = ttk.Combobox(lf_srv, textvariable=self._v_trial_container)
+        cb_trial_container.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+
+        ttk.Label(lf_srv, text="Usuario OS (peer auth):").grid(
+            row=2, column=0, sticky="e", padx=(0, _PAD), pady=(4, 0))
+        self._v_trial_exec_user = tk.StringVar()
+        ttk.Entry(lf_srv, textvariable=self._v_trial_exec_user).grid(
+            row=2, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(
+            lf_srv,
+            text="Solo si el contenedor exige 'docker exec -u <usuario>' (autenticacion peer). "
+                 "Dejar vacio para el caso normal.",
+            foreground="#666666", font=("Segoe UI", 8), wraplength=420,
+        ).grid(row=3, column=0, columnspan=3, sticky="w")
+
+        def _sync_pg_target_trial(*_):
+            container = self._v_trial_container.get().strip()
+            self._pg_target_trial.container = container
+            self._pg_target_trial.pg_user = self._docker_pg_users_trial.get(container, "postgres")
+            self._pg_target_trial.docker_exec_user = self._v_trial_exec_user.get().strip()
+        self._v_trial_container.trace_add("write", _sync_pg_target_trial)
+        self._v_trial_exec_user.trace_add("write", _sync_pg_target_trial)
+
+        def _detect_docker_trial():
+            ssh = _get_ssh()
+            if not ssh:
+                self._log("[ERROR] Trial — Docker: sin conexion SSH.")
+                return
+            self._log("Trial — detectando contenedores Postgres ...")
+            def _run():
+                try:
+                    containers = DockerManager(ssh).list_postgres_containers()
+                    def _fill():
+                        names = [c["name"] for c in containers]
+                        cb_trial_container["values"] = names
+                        self._docker_pg_users_trial = {c["name"]: c["pg_user"] for c in containers}
+                        if not names:
+                            self._log("  No se encontraron contenedores Postgres (o Docker no esta disponible).")
+                        for c in containers:
+                            self._log(f"  {c['name']}  ({c['image']})  usuario pg: {c['pg_user']}  {c['ports']}")
+                    self.root.after(0, _fill)
+                except Exception as exc:
+                    self.root.after(0, lambda: self._log(f"[ERROR] Trial — Docker: {exc}"))
+            threading.Thread(target=_run, daemon=True).start()
+
+        ttk.Button(lf_srv, text="Detectar contenedores", command=_detect_docker_trial).grid(
+            row=1, column=2, pady=(6, 0))
+
         _refresh_srv()
 
         # ══════════════════════════════════════════════════════════════════
@@ -5772,7 +5910,7 @@ class BackupApp:
             self._log("Trial — detectando Odoo en el servidor ...")
             def _run():
                 try:
-                    b, c = TrialManager(ssh).find_odoo()
+                    b, c = TrialManager(ssh, target=self._pg_target_trial).find_odoo()
                     def _fill():
                         v_bin.set(b or "")
                         v_conf.set(c or "")
@@ -5814,7 +5952,7 @@ class BackupApp:
             self._log(f"Trial === Creando BD '{dn}' con -i base ===")
             def _run():
                 try:
-                    mgr = TrialManager(ssh)
+                    mgr = TrialManager(ssh, target=self._pg_target_trial)
                     mgr.create_clean_db(dn, b, c, log_callback=self._log)
                     params = mgr.query_db_params(dn)
                     nonlocal _source_params
@@ -5837,7 +5975,7 @@ class BackupApp:
             if not messagebox.askyesno("Confirmar", f"Eliminar BD '{dn}'?", icon="warning"):
                 return
             def _run():
-                TrialManager(ssh).drop_db(dn)
+                TrialManager(ssh, target=self._pg_target_trial).drop_db(dn)
                 self.root.after(0, lambda: self._log(f"Trial — BD '{dn}' eliminada."))
             threading.Thread(target=_run, daemon=True).start()
 
@@ -5893,7 +6031,7 @@ class BackupApp:
             self._log("Trial — listando bases de datos ...")
             def _run():
                 try:
-                    dbs = TrialManager(ssh).list_databases()
+                    dbs = TrialManager(ssh, target=self._pg_target_trial).list_databases()
                     def _fill():
                         lb_dbs.delete(0, "end")
                         for d in dbs:
@@ -5961,10 +6099,10 @@ class BackupApp:
             self._log(f"Trial === Aplicando en '{target}' ===")
             def _run():
                 try:
-                    TrialManager(ssh).apply_trial_params(
+                    TrialManager(ssh, target=self._pg_target_trial).apply_trial_params(
                         target, _source_params, log_callback=self._log)
                     self._log("Trial === Aplicacion completada. Verificando... ===")
-                    result = TrialManager(ssh).verify_target_params(target)
+                    result = TrialManager(ssh, target=self._pg_target_trial).verify_target_params(target)
                     for p in result:
                         self._log(f"  {p['key']:<28} {p['value']}")
                     self.root.after(0, lambda: _populate_verify_table(result))
@@ -5987,7 +6125,7 @@ class BackupApp:
             self._log(f"Trial — consultando '{target}' ...")
             def _run():
                 try:
-                    result = TrialManager(ssh).verify_target_params(target)
+                    result = TrialManager(ssh, target=self._pg_target_trial).verify_target_params(target)
                     self._log(f"  Parametros database.* en '{target}':")
                     for p in result:
                         self._log(f"  {p['key']:<28} {p['value']}")

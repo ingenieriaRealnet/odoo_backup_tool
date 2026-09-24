@@ -3,10 +3,14 @@ PostgreSQL dump operations executed via SSH.
 
 Connects as root and delegates to the postgres OS user with sudo,
 which matches the standard Odoo server setup used in this workspace.
+
+Also supports PostgreSQL running inside a Docker container (target.container
+set) via core.pg_exec — see DockerManager for container discovery.
 """
 from __future__ import annotations
 from typing import Callable
 from .ssh_client import SSHClient
+from .pg_exec import PgTarget, build_psql, build_pg_dump, wrap_exec
 
 # Databases that are always excluded from the selection list
 _SYSTEM_DBS = {"template0", "template1", "postgres"}
@@ -15,8 +19,9 @@ _SYSTEM_DBS = {"template0", "template1", "postgres"}
 class DBManager:
     """Creates and cleans up PostgreSQL dumps on a remote server."""
 
-    def __init__(self, ssh: SSHClient) -> None:
+    def __init__(self, ssh: SSHClient, target: PgTarget | None = None) -> None:
         self._ssh = ssh
+        self._target = target or PgTarget()
 
     # ── Database discovery ────────────────────────────────────────────────
 
@@ -30,7 +35,19 @@ class DBManager:
         Raises:
             RuntimeError: If the psql command fails.
         """
-        cmd = "sudo -u postgres psql -l -t -A --field-separator='|'"
+        # Consulta directa a pg_database en vez de 'psql -l': -l imprime la
+        # columna de privilegios de acceso (ACL, un array), y cuando esa ACL
+        # tiene mas de una entrada (comun en template0/template1 de Postgres
+        # 15+), psql -A la imprime en varias lineas — 'splitlines()' entonces
+        # confunde cada linea extra de la ACL con un nombre de BD adicional
+        # inexistente (confirmado en contenedores Postgres 15 de Pruebas_19,
+        # ej. 'odoo=CTc/odoo'). La consulta a pg_database no trae esa columna.
+        # -d postgres: sin -d, psql intenta conectar a una BD con el mismo
+        # nombre que el usuario (-U), que no existe en Postgres dockerizado
+        # (confirmado: "database 'odoo' does not exist" contra Pruebas_19).
+        # 'postgres' siempre existe (no es un template, nunca se filtra).
+        sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname"
+        cmd = build_psql(self._target, f"-d postgres -t -A -c \"{sql}\"")
         code, out, err = self._ssh.execute(cmd)
 
         if code != 0:
@@ -38,8 +55,7 @@ class DBManager:
 
         databases: list[str] = []
         for line in out.splitlines():
-            parts = line.split("|")
-            name = parts[0].strip() if parts else ""
+            name = line.strip()
             if name and name not in _SYSTEM_DBS:
                 databases.append(name)
 
@@ -72,10 +88,12 @@ class DBManager:
         Raises:
             RuntimeError: If free space in /tmp is less than the database size.
         """
-        # Get database size in bytes via PostgreSQL catalog
+        # Get database size in bytes via PostgreSQL catalog.
+        # -d postgres: sin -d, psql en modo contenedor intenta conectar a
+        # una BD con el mismo nombre que el usuario -U, que no existe.
         code, size_out, _ = self._ssh.execute(
-            f"sudo -u postgres psql -t -c "
-            f"\"SELECT pg_database_size('{db_name}')\" 2>/dev/null"
+            build_psql(self._target,
+                f"-d postgres -t -c \"SELECT pg_database_size('{db_name}')\" 2>/dev/null")
         )
         if code != 0 or not size_out.strip().isdigit():
             # Cannot determine — proceed optimistically
@@ -149,18 +167,29 @@ class DBManager:
         # nice -n 19: lowest CPU priority so Odoo keeps responding normally.
         # --lock-wait-timeout: fail fast (30s) instead of blocking indefinitely
         # if another transaction holds locks on the DB being dumped.
-        cmd = (
-            f"nice -n 19 sudo -u postgres pg_dump -U postgres -d {db_name} "
-            f"-F {fmt_flag} -b --lock-wait-timeout=30000 -f {remote_path}"
+        # En modo contenedor, pg_dump escribe DENTRO del contenedor en la
+        # misma ruta /tmp/... ; se extrae al host con 'docker cp' al terminar
+        # (el resto del flujo, ej. SFTP, ya asume el archivo en el host).
+        dump_target_path = remote_path
+        cmd = build_pg_dump(
+            self._target,
+            f"-d {db_name} -F {fmt_flag} -b --lock-wait-timeout=30000 "
+            f"-f {dump_target_path}",
         )
+        if not self._target.container:
+            cmd = f"nice -n 19 {cmd}"
 
         def _heartbeat(status: str) -> None:
             if log_callback:
                 log_callback(f"  [pg_dump en curso] {status}")
 
+        watch_cmd = f"ls -lh {remote_path} 2>/dev/null || echo 'generando...'"
+        if self._target.container:
+            watch_cmd = wrap_exec(self._target, watch_cmd)
+
         code, _, err = self._ssh.execute_long(
             cmd,
-            watch_cmd=f"ls -lh {remote_path} 2>/dev/null || echo 'generando...'",
+            watch_cmd=watch_cmd,
             heartbeat_callback=_heartbeat,
             timeout=3600,
             cancel_event=cancel_event,
@@ -169,7 +198,19 @@ class DBManager:
         if code != 0:
             raise RuntimeError(f"pg_dump fallo para '{db_name}':\n{err}")
 
-        # Verify the output file exists and log its size
+        if self._target.container:
+            if log_callback:
+                log_callback(f"Extrayendo dump del contenedor '{self._target.container}' al host ...")
+            cp_code, _, cp_err = self._ssh.execute(
+                f"docker cp {self._target.container}:{remote_path} {remote_path}",
+                timeout=600,
+            )
+            if cp_code != 0:
+                raise RuntimeError(
+                    f"No se pudo extraer el dump del contenedor:\n{cp_err}"
+                )
+
+        # Verify the output file exists (on the host) and log its size
         v_code, v_out, _ = self._ssh.execute(f"ls -lh {remote_path}")
         if v_code != 0:
             raise RuntimeError(f"Archivo de dump no encontrado: {remote_path}")
@@ -184,3 +225,5 @@ class DBManager:
     def cleanup_remote(self, remote_path: str) -> None:
         """Delete a temporary file on the remote server (best-effort)."""
         self._ssh.execute(f"sudo rm -f {remote_path}")
+        if self._target.container:
+            self._ssh.execute(wrap_exec(self._target, f"rm -f {remote_path}"))
