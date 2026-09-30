@@ -283,7 +283,9 @@ class SshTerminalPanel(ttk.Frame):
                 # Iniciar poller de salida
                 self.after(50, self._poll_output)
             except Exception as exc:
-                self.after(0, lambda: self._append_local(
+                # exc=exc: the name is unbound once the except block ends,
+                # before Tk runs the deferred lambda.
+                self.after(0, lambda exc=exc: self._append_local(
                     f"[Error al abrir terminal] {exc}\n", "error"
                 ))
 

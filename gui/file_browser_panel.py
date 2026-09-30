@@ -341,11 +341,15 @@ class FileBrowserPanel(ttk.Frame):
             except FileNotFoundError:
                 self.after(0, lambda: self._set_status(f"Ruta no existe: {path}"))
                 return
+            # e=e: Python unbinds the exception name when the except block
+            # ends, before Tk runs the deferred lambda — without the default
+            # argument the callback raised NameError and the status never
+            # showed the real cause.
             except PermissionError as e:
-                self.after(0, lambda: self._set_status(str(e)))
+                self.after(0, lambda e=e: self._set_status(str(e)))
                 return
             except Exception as e:
-                self.after(0, lambda: self._set_status(f"Error: {e}"))
+                self.after(0, lambda e=e: self._set_status(f"Error: {e}"))
                 return
             self.after(0, lambda: self._populate(entries))
 
