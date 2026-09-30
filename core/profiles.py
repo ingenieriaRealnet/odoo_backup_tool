@@ -46,14 +46,40 @@ class ProfileManager:
         # Mirrors the lock already used by ScheduleManager for schedules.json.
         self._lock = threading.Lock()
         self._profiles: list[dict] = []
+        # mtime of servers.json as last read/written by THIS instance —
+        # see _reload_if_changed().
+        self._mtime: float = 0.0
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────────────
+
+    def _reload_if_changed(self) -> None:
+        """
+        Re-read servers.json if another process modified it. Must be called
+        with self._lock held.
+
+        The headless monitor (main.py --headless) keeps running while
+        profiles are edited from the GUI; without this it would keep
+        connecting with the credentials it loaded at startup.
+        """
+        try:
+            mtime = _PROFILE_FILE.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._mtime:
+            return
+        previous = self._profiles
+        self._load()
+        if not self._profiles and previous:
+            # Unreadable mid-change: keep what we had; the next call retries.
+            self._profiles = previous
+            self._mtime = 0.0
 
     def _load(self) -> None:
         """Load profiles from disk. Silently starts empty if file missing."""
         if _PROFILE_FILE.exists():
             try:
+                self._mtime = _PROFILE_FILE.stat().st_mtime
                 with open(_PROFILE_FILE, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                     self._profiles = data.get("servers", [])
@@ -77,12 +103,14 @@ class ProfileManager:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump({"servers": self._profiles}, fh, indent=2, ensure_ascii=False)
         os.replace(tmp_path, _PROFILE_FILE)
+        self._mtime = _PROFILE_FILE.stat().st_mtime
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def names(self) -> list[str]:
         """Return the list of profile names in storage order."""
         with self._lock:
+            self._reload_if_changed()
             return [p["name"] for p in self._profiles]
 
     def get(self, name: str) -> Optional[dict]:
@@ -95,6 +123,7 @@ class ProfileManager:
             (gdrive fields default to "" for profiles saved before v1.2)
         """
         with self._lock:
+            self._reload_if_changed()
             for p in self._profiles:
                 if p["name"] == name:
                     result = dict(p)
@@ -159,6 +188,7 @@ class ProfileManager:
         }
 
         with self._lock:
+            self._reload_if_changed()
             # Replace existing entry with same name, or append
             for i, p in enumerate(self._profiles):
                 if p["name"] == name:
@@ -176,6 +206,7 @@ class ProfileManager:
             True if a profile was removed, False if it did not exist.
         """
         with self._lock:
+            self._reload_if_changed()
             before = len(self._profiles)
             self._profiles = [p for p in self._profiles if p["name"] != name]
             if len(self._profiles) < before:

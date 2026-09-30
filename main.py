@@ -48,6 +48,20 @@ def _set_window_icon(root: tk.Tk) -> None:
 
 
 def main() -> None:
+    # --headless: scheduled backups + client monitoring with no window,
+    # meant to be started by Windows at logon so the monitor does not
+    # depend on someone opening the application. See core/headless.py.
+    if "--headless" in sys.argv[1:]:
+        from core.headless import run_headless
+        sys.exit(run_headless())
+
+    # --no-scheduler: open the window without running the schedule, the
+    # orphan sweep or the monitor. For development and for inspecting the
+    # tool on a second machine — a second running scheduler would fire
+    # every rule twice. Also honoured as the OBT_NO_SCHEDULER=1 env var.
+    if "--no-scheduler" in sys.argv[1:]:
+        os.environ["OBT_NO_SCHEDULER"] = "1"
+
     root = _DND_ROOT_CLS()
     _set_window_icon(root)
     BackupApp(root)
