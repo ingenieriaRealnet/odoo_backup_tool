@@ -31,6 +31,7 @@ Herramienta de escritorio para **respaldar, restaurar y administrar instancias O
 10. [Lo que la herramienta NO hace](#10-lo-que-la-herramienta-no-hace)
 11. [Arquitectura interna](#11-arquitectura-interna)
 12. [Dependencias](#12-dependencias)
+13. [Monitoreo de clientes, alertas y modo en segundo plano](#13-monitoreo-de-clientes-alertas-y-modo-en-segundo-plano)
 
 ---
 
@@ -106,10 +107,13 @@ Salida: `output/dist/OdooBackupTool`
 
 ## 4. Vista general de la interfaz
 
-La ventana principal se divide en dos zonas:
+La ventana principal se divide en tres zonas:
 
-- **Zona superior** — `ttk.Notebook` con 10 pestañas (Conexiones, BD, Filestore, Destino, Ejecutar, Restaurar, Addons, Explorador, Terminal, Trial)
+- **Barra lateral** — navegación agrupada por secciones: *Monitoreo* (Panel de clientes, Alertas), *Respaldo manual* (pasos 1 a 5), *Automatización* (Reglas programadas, Historial) y *Servidor* (Restaurar, Addons, Explorador, Terminal, Trial). Un contador junto a "Panel de clientes" indica cuántos clientes están en estado crítico o en alerta.
+- **Zona superior** — la página seleccionada. La aplicación abre en el **Panel de clientes**.
 - **Zona inferior** — Panel de log de operaciones con resaltado de color, botones de exportar y copiar
+
+En este documento, "pestaña" y "Tab N" se refieren a las páginas de la barra lateral; la numeración de los pasos del respaldo manual se conserva.
 
 Las pestañas **2 a 5** (BD, Filestore, Destino, Ejecutar) permanecen visualmente deshabilitadas (gris con texto atenuado) hasta que se establezca la conexión con el Servidor A. Esto indica al usuario que existe una dependencia de conexión antes de proceder.
 
@@ -599,12 +603,83 @@ pip install -r requirements.txt
 
 ---
 
+## 13. Monitoreo de clientes, alertas y modo en segundo plano
+
+### Qué vigila
+
+Cada cliente con una regla de respaldo programado se monitorea con el mismo perfil de servidor que usa el respaldo. No hay que configurar nada por cliente.
+
+| Señal | Alerta | Crítico |
+|---|---|---|
+| Disco usado | 80 % | 90 % |
+| Días estimados hasta llenarse (tendencia de 14 días) | 21 | 7 |
+| Respaldos fallidos seguidos | 2 | 3 |
+| Días sin un respaldo correcto | 3 | 5 |
+| Servidor inalcanzable por SSH | 1 sondeo | 2 sondeos seguidos |
+| PostgreSQL no acepta conexiones | — | sí |
+| El próximo respaldo no cabe en `/tmp` | sí | — |
+
+El sondeo es de **solo lectura** (`df`, `/proc`, una consulta `SELECT` a PostgreSQL y una petición a `localhost:8069`) y corre cada 6 horas por defecto. Los umbrales se cambian en la página **Configuración** (sección Monitoreo).
+
+### Panel de clientes
+
+Una fila por cliente con su nivel (OK, Alerta, Crítico, Sin datos), uso de disco, proyección de llenado, antigüedad del último respaldo correcto y fallos seguidos. Al seleccionar un cliente se muestra el diagnóstico y la gráfica de uso de disco de los últimos 30 días. **Sondear ahora** consulta todos los servidores de inmediato.
+
+"Sin datos" significa que el último sondeo es demasiado antiguo para confiar en él; no equivale a OK.
+
+### Alertas por correo
+
+En la página **Configuración** (sección Monitoreo) se configura la cuenta SMTP y los destinatarios. Se envía un correo:
+
+- cuando un cliente entra en alerta o en crítico, se agrava o se recupera;
+- cada 24 horas mientras algo siga en crítico;
+- una vez al día con el resumen de todos los clientes. Este resumen llega aunque todo esté bien: **si un día no llega, el monitor no está corriendo**.
+
+Use **Enviar correo de prueba** para validar la cuenta antes de guardar. Sin correo configurado, los avisos solo aparecen en el Panel y como notificación de Windows.
+
+**Cuentas de Google Workspace o Gmail** (el dominio `realnet.com.co` está en Google):
+
+1. En la cuenta que enviará las alertas (por ejemplo `ingenieria@realnet.com.co`), active la verificación en dos pasos si no lo está.
+2. Cree una contraseña de aplicación en `https://myaccount.google.com/apppasswords` (nombre sugerido: "Odoo Backup Tool"). Google muestra 16 caracteres una sola vez.
+3. En **Configuración**, pulse **Usar Google Workspace (Gmail)**: carga `smtp.gmail.com`, puerto 587, STARTTLS.
+4. Usuario y remitente: la dirección completa de la cuenta. Contraseña: la contraseña de aplicación (no la de la cuenta).
+5. Destinatarios, **Enviar correo de prueba** y, si llega, **Guardar**.
+
+Si la página de contraseñas de aplicación dice que no está disponible, el administrador de Google Workspace las tiene deshabilitadas para la organización.
+
+### Modo en segundo plano
+
+El programador de respaldos y el monitor solo funcionan mientras haya una instancia en ejecución. Para no depender de abrir la aplicación, use el interruptor **Monitor en segundo plano** en la página **Configuración**:
+
+- **Activar**: registra `OdooBackupTool.exe --headless` para que Windows lo inicie en cada inicio de sesión (entrada del usuario en `HKCU\...\CurrentVersion\Run`, sin permisos de administrador) y lo inicia de inmediato.
+- **Desactivar**: quita el registro y detiene el monitor.
+
+El monitor corre sin ventana y deja su registro en `~/.odoo_backup_tool/headless.log`. La línea de estado indica si está activo, en espera o desactivado.
+
+Solo **una** instancia ejecuta el programador. Mientras la ventana está abierta, ella lo ejecuta y el monitor espera; al cerrarla, el monitor lo asume en menos de un minuto. Si la aplicación se abre con el monitor ya a cargo, la ventana funciona como visor: muestra el panel, permite editar reglas y respaldos manuales, y "Ejecutar ahora" se delega al monitor. Si el monitor se detiene, la ventana asume el programador automáticamente.
+
+`build.bat` cierra todas las instancias de `OdooBackupTool.exe`, incluido el monitor. Después de compilar, inícielo de nuevo con **Iniciar ahora** en **Configuración**, o cerrando e iniciando sesión.
+
+### Abrir sin programador
+
+```powershell
+OdooBackupTool.exe --no-scheduler     # o: python main.py --no-scheduler
+```
+
+Abre la ventana sin ejecutar reglas, barrido de temporales ni alertas. Útil para desarrollo o para consultar el panel desde un segundo equipo sin duplicar los respaldos.
+
+---
+
 ## Configuración persistente
 
 | Archivo | Contenido |
 |---|---|
 | `~/.odoo_backup_tool/servers.json` | Perfiles de servidor guardados |
 | `~/.odoo_backup_tool/settings.json` | Geometría de ventana y posición del divisor del log |
+| `~/.odoo_backup_tool/monitor_settings.json` | Umbrales, intervalo de sondeo y cuenta de correo de alertas |
+| `~/.odoo_backup_tool/monitor_state.json` | Historial de respaldos por regla y alertas ya notificadas |
+| `~/.odoo_backup_tool/health_metrics.jsonl` | Muestras de salud de los servidores (180 días) |
+| `~/.odoo_backup_tool/headless.log` | Registro del monitor en segundo plano |
 | `~/.odoo_backup_tool/inventories/` | Inventarios JSON de backups con destino remoto |
 | `~/.ssh/{nombre_llave}` | Llaves Ed25519 generadas desde Tab 7 (modo 0600) |
 
