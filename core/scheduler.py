@@ -936,17 +936,28 @@ class BackupScheduler:
                 #   leave the actual backup artifacts un-retained.
                 retention = int(rule.get("retention_days", 90))
                 if retention > 0:
-                    uploader = self._get_uploader(creds_path, folder_id)
-                    prefixes = (
-                        [f"{db_name}_"]
-                        if bundled
-                        else [f"odoo_{db_name}_", f"filestore_{db_name}_", f"{db_name}_"]
-                    )
-                    deleted = 0
-                    for prefix in prefixes:
-                        deleted += uploader.cleanup_old_files(prefix, retention, log_callback=log)
-                    if deleted:
-                        log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
+                    # Retention is housekeeping: by now every upload is verified,
+                    # so a failure here must not mark the backup as failed nor
+                    # skip the server /tmp cleanup below (2026-10-13,
+                    # backup_equiredes: Drive 500 on the listing -> "error" and
+                    # ~15 GB left in /tmp). Old files get retried next run.
+                    try:
+                        uploader = self._get_uploader(creds_path, folder_id)
+                        prefixes = (
+                            [f"{db_name}_"]
+                            if bundled
+                            else [f"odoo_{db_name}_", f"filestore_{db_name}_", f"{db_name}_"]
+                        )
+                        deleted = 0
+                        for prefix in prefixes:
+                            deleted += uploader.cleanup_old_files(prefix, retention, log_callback=log)
+                        if deleted:
+                            log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[{label}] [aviso] No se pudo aplicar la retencion en Drive "
+                            f"(se reintentara en la proxima ejecucion): {exc}"
+                        )
 
             # ── Cleanup server tmp files ──────────────────────────────────────
             if rule.get("cleanup_server"):
