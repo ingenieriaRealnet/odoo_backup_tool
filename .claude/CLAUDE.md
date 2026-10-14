@@ -42,7 +42,10 @@ odoo_backup_tool/
 │   ├── monitor.py         # HealthMonitor: orquesta sondeo/evaluación/alertas desde el tick del scheduler
 │   ├── instance_lock.py   # SchedulerLock: una sola instancia ejecuta el programador
 │   ├── headless.py        # Modo sin ventana (--headless)
-│   └── background_service.py  # Interruptor del modo sin ventana: HKCU Run + PID (headless.pid)
+│   ├── background_service.py  # Interruptor del modo sin ventana: HKCU Run + PID (headless.pid)
+│   └── api/               # Conexiones API: connections.py (api_connections.json), credentials.py
+│                          #   (Administrador de credenciales), connectors.py (odoo_json2, rest_bearer),
+│                          #   realnet_board.py (tablero de tareas + mesa de ayuda de realnet.com.co)
 ├── gui/
 │   ├── app.py             # BackupApp: ventana, tema, barra de estado, log, cola, cierre
 │   ├── constants.py       # Constantes de la ventana (antes al inicio de app.py)
@@ -51,9 +54,11 @@ odoo_backup_tool/
 │   ├── sidebar.py         # Navegación lateral (maneja el Notebook oculto)
 │   ├── health_panel.py    # Página "Panel de clientes" (dashboard)
 │   ├── alerts_panel.py    # Página "Configuración" del monitor: segundo plano, umbrales y correo
+│   ├── api_panel.py       # Página "Conexiones API" (Integraciones)
 │   └── tabs/              # Un mixin de BackupApp por área: backup_wizard, restore, addons,
-│                          #   server_tools, automation, monitoring_pages
+│                          #   server_tools, automation, monitoring_pages, integrations
 ├── tests/                 # unittest: monitoreo, alertas, scheduler compartido, headless
+├── api_cli.py             # CLI de conexiones API y del tablero Realnet (se ejecuta desde fuente)
 ├── OdooBackupTool.spec    # Config PyInstaller
 ├── build.bat              # Script de compilación
 ├── requirements.txt
@@ -113,6 +118,7 @@ Todos los archivos de usuario se guardan en `~/.odoo_backup_tool/`:
 | `scheduler.lock` / `.info` | Quién ejecuta el programador (GUI o monitor en segundo plano) |
 | `run_requests/*.req` | "Ejecutar ahora" pedido por una ventana que no es dueña del programador |
 | `headless.log` | Log del modo `--headless` (rotativo) |
+| `api_connections.json` | Conexiones API (URL, tipo, parámetros). SIN claves: van al Administrador de credenciales de Windows (`odoo_backup_tool/api/<nombre>`) |
 
 ## Convenciones de código
 
@@ -172,3 +178,4 @@ Phase B (transferencia):
 - `_sched_append_log` se llamaba desde "Ejecutar ahora" pero no existía: el job arrancaba y el handler moría con `AttributeError`. Ya está definido en `gui/tabs/automation.py`.
 - **Ventana de ayuda no abría** (`gui/help_window.py`): el método `_configure()` tapaba `Misc._configure()` de tkinter, y el `self.configure(bg=...)` de adentro terminaba llamándolo con argumentos de más (`TypeError`). Renombrado a `_setup_window()`. No usar nombres de métodos internos de tkinter (`_configure`, `_options`, `_bind`, `_root`...) en subclases de widgets. La ayuda tiene ahora la sección "Monitoreo y alertas".
 - **La retención en Drive no debe anular un respaldo ya subido** (incidente `backup_equiredes` 2026-10-13): los 3 archivos se subieron y verificaron, pero un `HttpError 500` transitorio de Google en el `files().list()` de `cleanup_old_files` (no pasaba por `_with_retry`, solo el borrado) marcó la regla como error y, al saltar al `except`, dejó ~15 GB de temporales en `/tmp` del servidor. Ahora la consulta usa `_with_retry` y en `_run_rule` la retención va en su propio `try/except` que solo deja un `[aviso]`: el respaldo queda "ok", se limpia el servidor y la retención se reintenta en la siguiente ejecución. Prueba: `tests/test_gdrive_retention.py`.
+- **Conexiones API** (`core/api/`, página "Conexiones API" = 14, `api_cli.py`; 2026-10-14): extensión para conectar la herramienta con varios sistemas por API. Cada tipo de sistema es una clase de `connectors.py` registrada en `CONNECTOR_TYPES` (hoy `odoo_json2` para Odoo 19+ y `rest_bearer` genérico); agregar un sistema nuevo = una subclase de `ApiConnector`, la GUI y el CLI la toman del registro. Las claves NUNCA van a `api_connections.json`: `WindowsCredentialStore` (ctypes sobre advapi32, sin dependencias) o la variable `OBT_API_KEY_<NOMBRE>`. Primer uso: conexión `realnet` (realnet.com.co, BD `ingenieriarealnet-realnetsh-v19-30917601`) con `realnet_board.py`, que reemplaza el registro de tarjetas y la lectura de tickets por Chrome (motivo: ~1.500 capturas en 14 días eran el mayor consumo de tokens de Claude Code). En Odoo 19 XML-RPC está obsoleto: se usa JSON-2 (`/json/2/<modelo>/<método>`, API key como bearer). "Detener" reproduce el flujo de la UI: `action_timer_stop` devuelve el asistente `hr.timesheet.stop.timer.confirmation.wizard`, que se crea con `default_timesheet_id` y se confirma con `action_save_timesheet`. Toda escritura del CLI es PREVIEW (código 3) salvo `--yes`; los comandos de tickets son solo lectura. Prueba: `tests/test_api_connections.py`.

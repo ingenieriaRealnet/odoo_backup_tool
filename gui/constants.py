@@ -47,6 +47,9 @@ _OWNERSHIP_RETRY_MS = 60_000
 # notebook order, decides what the user sees first.
 _TAB_PANEL = 12
 _TAB_ALERTS = 13
+# "Conexiones API" (gui/api_panel.py), appended after the monitoring pages
+# for the same reason.
+_TAB_API = 14
 
 # Sidebar layout: (section, [(label, notebook page index), ...]).
 _SIDEBAR_SECTIONS = [
@@ -60,6 +63,7 @@ _SIDEBAR_SECTIONS = [
         ("Restaurar", 5), ("Addons", 6), ("Explorador", 7),
         ("Terminal", 8), ("Trial", 9),
     ]),
+    ("Integraciones", [("Conexiones API", _TAB_API)]),
 ]
 
 # Interval of the sidebar<->notebook state sync (enabled/disabled pages).

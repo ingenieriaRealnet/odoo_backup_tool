@@ -45,6 +45,7 @@ from gui.tabs.restore import RestoreMixin
 from gui.tabs.addons import AddonsMixin
 from gui.tabs.server_tools import ServerToolsMixin
 from gui.tabs.automation import AutomationMixin
+from gui.tabs.integrations import IntegrationsMixin
 
 
 class BackupApp(
@@ -54,6 +55,7 @@ class BackupApp(
     AddonsMixin,
     ServerToolsMixin,
     AutomationMixin,
+    IntegrationsMixin,
 ):
     """Root window and controller for the Odoo Backup Tool."""
 
@@ -640,6 +642,8 @@ class BackupApp(
         # Monitoring pages — must stay last, see _TAB_PANEL.
         self._tab_health_panel()
         self._tab_alert_settings()
+        # Integrations page — after the monitoring pages, see _TAB_API.
+        self._tab_api_connections()
 
         # Lock backup tabs 2-5 until connected
         for i in range(1, 5):
