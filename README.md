@@ -3,7 +3,7 @@
 Herramienta de escritorio para **respaldar, restaurar y administrar instancias Odoo** en servidores Linux remotos, sin necesidad de acceso directo al servidor. Opera completamente a través de SSH/SFTP desde una máquina Windows o Linux.
 
 ![Odoo Backup Tool — Vista general](docs/screenshot_main.png)
-> Referencia
+> Panel de clientes con la barra lateral (octubre 2026). La IP y la BD del diagnóstico se reemplazaron por valores de ejemplo.
 
 ---
 
@@ -24,6 +24,9 @@ Herramienta de escritorio para **respaldar, restaurar y administrar instancias O
    - [Tab 8 — Explorador](#tab-8--explorador)
    - [Tab 9 — Terminal](#tab-9--terminal)
    - [Tab Trial](#tab-trial)
+   - [Reglas programadas](#reglas-programadas)
+   - [Historial](#historial)
+   - [Conexiones API](#conexiones-api)
 6. [Sistema de perfiles de servidor](#6-sistema-de-perfiles-de-servidor)
 7. [Log de operaciones](#7-log-de-operaciones)
 8. [Inventario de backup](#8-inventario-de-backup)
@@ -32,6 +35,7 @@ Herramienta de escritorio para **respaldar, restaurar y administrar instancias O
 11. [Arquitectura interna](#11-arquitectura-interna)
 12. [Dependencias](#12-dependencias)
 13. [Monitoreo de clientes, alertas y modo en segundo plano](#13-monitoreo-de-clientes-alertas-y-modo-en-segundo-plano)
+14. [Línea de comandos de conexiones API (`api_cli.py`)](#14-línea-de-comandos-de-conexiones-api-api_clipy)
 
 ---
 
@@ -109,7 +113,17 @@ Salida: `output/dist/OdooBackupTool`
 
 La ventana principal se divide en tres zonas:
 
-- **Barra lateral** — navegación agrupada por secciones: *Monitoreo* (Panel de clientes, Alertas), *Respaldo manual* (pasos 1 a 5), *Automatización* (Reglas programadas, Historial) y *Servidor* (Restaurar, Addons, Explorador, Terminal, Trial). Un contador junto a "Panel de clientes" indica cuántos clientes están en estado crítico o en alerta.
+- **Barra lateral** — navegación agrupada por secciones:
+
+  | Sección | Páginas |
+  |---|---|
+  | *Monitoreo* | Panel de clientes, Configuración (monitor en segundo plano, umbrales y correo) |
+  | *Respaldo manual* | 1. Conexión, 2. Base de datos, 3. Filestore, 4. Destino, 5. Ejecutar |
+  | *Automatización* | Reglas programadas, Historial |
+  | *Servidor* | Restaurar, Addons, Explorador, Terminal, Trial |
+  | *Integraciones* | Conexiones API |
+
+  Un contador junto a "Panel de clientes" indica cuántos clientes están en estado crítico o en alerta.
 - **Zona superior** — la página seleccionada. La aplicación abre en el **Panel de clientes**.
 - **Zona inferior** — Panel de log de operaciones con resaltado de color, botones de exportar y copiar
 
@@ -407,6 +421,64 @@ Los valores obtenidos se muestran en una tabla (clave, valor, create_date, write
 
 ---
 
+### Reglas programadas
+
+**Propósito:** Respaldos diarios automáticos por cliente, sin intervención. Cada regla es un respaldo completo (dump + filestore) de una BD hacia un destino, a una hora fija.
+
+**Lista de reglas** — columnas: `#`, Habilitado, Cliente, BD, Destino, Hora, Próximo, Último resultado.
+
+| Botón | Acción |
+|---|---|
+| **+ Agregar** / **Editar** | Abre el diálogo de la regla |
+| **Eliminar** | Borra la regla (con confirmación) |
+| **▶ Ejecutar ahora** | Lanza la regla de inmediato, sin esperar su hora |
+| **⏸ Pausar** / **▶ Reanudar** | Detiene o reanuda el programador completo. El indicador muestra *● Programador activo* o *⏸ Programador pausado* |
+
+**Campos de la regla:** nombre, perfil del servidor, nombre de la BD y formato, incluir dump / incluir filestore (ruta raíz y carpeta de la BD), hora de ejecución (HH MM), destino (Google Drive, directorio local o servidor remoto), retención en días (`0` = sin límite), *Limpiar /tmp/ del servidor al terminar* y *Regla habilitada*.
+
+Para destino **Google Drive** se indican el JSON de la Service Account y el ID de la carpeta. La casilla **"Subida directa servidor → Drive (rclone)"** hace que el servidor suba a Drive por sí mismo, sin pasar los datos por esta máquina. Si el servidor no tiene salida a Google o no se puede instalar rclone, la regla usa el modo relé (streaming a través de esta máquina).
+
+**Comportamiento a tener en cuenta:**
+
+- **El programador solo corre si hay una instancia abierta:** la ventana o el monitor en segundo plano (ver [sección 13](#13-monitoreo-de-clientes-alertas-y-modo-en-segundo-plano)). Si el equipo está apagado o **suspendido**, no se ejecuta nada. Al volver, las reglas vencidas se disparan juntas.
+- Cuando varias reglas vencen a la vez, arrancan **escalonadas cada 120 s** ("En cola — ... inicio programado en 120s") para no saturar la subida a Drive. Como máximo hay **2 subidas a Drive simultáneas**.
+- **"Ejecutar ahora" no duplica una regla que ya está corriendo:** respeta el mismo control que el disparo automático.
+- Para Drive, el dump, el filestore y el inventario se suben **por separado y en paralelo** (no en un `.tar`). La retención borra los archivos más antiguos que el número de días configurado. Un error transitorio en la retención deja solo un `[aviso]`: el respaldo queda OK y la retención se reintenta en la siguiente ejecución.
+- **Cada temporal en `/tmp` del servidor se anota en un manifiesto antes de crearse.** Si un respaldo se interrumpe (corte de red, cierre forzado), el temporal parcial se borra en el siguiente arranque (`[limpieza-huerfanos]` en el log).
+- Al terminar, cada regla muestra una notificación de Windows con el resultado.
+
+---
+
+### Historial
+
+**Propósito:** Registro persistente de todo lo que hizo la herramienta contra los servidores: respaldos manuales y programados, restauraciones, sincronizaciones de addons y sesiones de terminal SSH.
+
+- Columnas: Fecha, Tipo, Servidor, Resultado, Resumen
+- Filtro **Tipo:** Todos / Backup manual / Backup programado / Restauración / Sync addons / Terminal SSH
+- **Ver detalle** (o doble clic) — muestra el log completo de esa ejecución
+- **Actualizar** — relee el archivo
+
+Se guardan las últimas **500** entradas en `~/.odoo_backup_tool/connection_history.jsonl`. Es la fuente para revisar por qué falló un respaldo de días anteriores.
+
+---
+
+### Conexiones API
+
+**Propósito:** Conectar la herramienta con sistemas externos por API. Hoy se usa para el tablero de tareas y la mesa de ayuda de `realnet.com.co` (conexión `realnet`).
+
+- Lista **Conexiones** (Nombre, Tipo, URL) a la izquierda; **Detalle** de la seleccionada a la derecha
+- Campos: Nombre, Tipo, URL base, Usuario de la clave, parámetros propios del tipo, Parámetros (JSON) y Notas
+- Botones: **Nueva**, **Guardar**, **Eliminar**, **Guardar clave...** y **Probar conexión**
+
+| Tipo | Uso |
+|---|---|
+| **Odoo 19+ (JSON-2)** (`odoo_json2`) | API externa de Odoo 19: `POST /json/2/<modelo>/<método>` con la API key como *bearer*. Requiere la base de datos. Aplica los mismos permisos y reglas de registro que el cliente web. En Odoo 19, XML-RPC está obsoleto. |
+| **REST genérico (Bearer token)** (`rest_bearer`) | Cualquier API JSON con `Authorization: Bearer <token>`. La prueba hace un `GET` a la ruta de prueba indicada. |
+
+> **Seguridad:** las claves **no** se guardan en `api_connections.json`. Van al **Administrador de credenciales de Windows** (entrada `odoo_backup_tool/api/<nombre>`) o en la variable de entorno `OBT_API_KEY_<NOMBRE>`. El archivo JSON solo contiene URL, tipo y parámetros.
+
+---
+
 ## 6. Sistema de perfiles de servidor
 
 Los perfiles se almacenan en `~/.odoo_backup_tool/servers.json` y se comparten entre los tres selectores de servidor de la aplicación (Servidor A, Servidor B y Servidor destino).
@@ -527,10 +599,10 @@ Es importante conocer las limitaciones para no asumir capacidades que la herrami
 | **No cifra las contraseñas almacenadas** | `servers.json` guarda contraseñas en texto plano |
 | **No soporta llave SSH para conexión de servidores** | Solo usuario + contraseña para A, B y destino. Las llaves SSH son solo para Git (Tab 7) |
 | **No detiene Odoo antes del backup** | Opera con Odoo corriendo; `pg_dump` es consistente, pero cambios durante el dump pueden quedar fuera del backup |
-| **No hace backup incremental** | Siempre dump completo + ZIP completo del filestore |
-| **No hace backup de múltiples BDs simultáneamente** | Se respalda una BD por ejecución |
+| **No hace backup incremental** | Siempre dump completo + `.tar` completo del filestore (los respaldos antiguos en `.zip` se siguen restaurando) |
+| **El respaldo manual es de una BD a la vez** | El asistente (pasos 1 a 5) respalda una BD por ejecución. Para varias BDs use **Reglas programadas**: cada regla es una BD y pueden correr en paralelo |
 | **No muestra tamaño de directorios en el explorador** | El Explorador (Tab 8) no calcula el tamaño de carpetas automáticamente |
-| **No permite subir archivos por drag-and-drop** | La transferencia local→servidor no está implementada vía drag-and-drop |
+| **Arrastrar y soltar solo sube, no descarga** | En el Explorador se pueden soltar archivos o carpetas desde Windows para subirlos a la carpeta remota actual (con confirmación). No se puede arrastrar desde el servidor hacia Windows |
 | **No soporta restauración de dumps cifrados** | Solo dumps generados por la herramienta o con `pg_dump` estándar |
 | **No modifica `odoo.conf`** | La neutralización desactiva parámetros en la BD, pero no redirige la instancia Odoo a la nueva BD |
 | **No hace backup de la configuración de Odoo** | No respalda `odoo.conf`, módulos instalados de Enterprise, ni certificados DIAN |
@@ -546,25 +618,66 @@ Es importante conocer las limitaciones para no asumir capacidades que la herrami
 
 ```
 odoo_backup_tool/
-├── main.py                       # Punto de entrada — crea ventana y lanza BackupApp
+├── main.py                       # Punto de entrada: ventana, --headless o --no-scheduler
+├── api_cli.py                    # CLI de conexiones API y del tablero Realnet (ver sección 14)
 ├── gui/
-│   ├── app.py                    # BackupApp: controlador principal (~4400 líneas)
+│   ├── app.py                    # BackupApp: ventana, tema, cola, log y cierre (hereda los mixins de tabs/)
+│   ├── constants.py              # Índices de página y estructura de la barra lateral
+│   ├── theme.py                  # Paleta y fuentes
+│   ├── sidebar.py                # Navegación lateral (maneja el Notebook con las pestañas ocultas)
+│   ├── dialogs.py                # Diálogos de sobrescritura y de regla programada
+│   ├── health_panel.py           # Página "Panel de clientes"
+│   ├── alerts_panel.py           # Página "Configuración" del monitor
+│   ├── api_panel.py              # Página "Conexiones API"
 │   ├── file_browser_panel.py     # FileBrowserPanel: panel explorador individual
 │   ├── ssh_terminal_panel.py     # SSHTerminalPanel: terminal PTY individual
 │   ├── icons.py                  # Generador de íconos con Pillow (sin archivos externos)
-│   └── help_window.py            # Ventana de ayuda contextual
-└── core/
-    ├── ssh_client.py             # Wrapper paramiko: SSH, SFTP, ejecución remota
-    ├── profiles.py               # Perfiles de servidor (lectura/escritura de servers.json)
-    ├── db_manager.py             # pg_dump en servidor remoto
-    ├── filestore_manager.py      # Descubrimiento y compresión del filestore
-    ├── transfer.py               # Transferencia SFTP local y server-to-server (sshpass scp)
-    ├── restore_manager.py        # Restauración completa BD + filestore + neutralización
-    ├── addons_manager.py         # Clone/pull desde Git con autenticación por llave
-    ├── inventory_manager.py      # Captura de métricas del sistema (snapshot JSON)
-    ├── trial_manager.py          # Actualización de parámetros database.* en Odoo
-    └── file_browser.py           # Listado de filesystem remoto vía SFTP (stat, chmod, mv, rm)
+│   ├── help_window.py            # Ventana de ayuda contextual
+│   └── tabs/                     # Un mixin de BackupApp por área
+│       ├── backup_wizard.py      #   Respaldo manual (pasos 1 a 5)
+│       ├── restore.py            #   Restaurar
+│       ├── addons.py             #   Addons / Git
+│       ├── server_tools.py       #   Explorador, Terminal y Trial
+│       ├── automation.py         #   Reglas programadas e Historial
+│       ├── monitoring_pages.py   #   Panel de clientes y Configuración
+│       └── integrations.py       #   Conexiones API
+├── core/
+│   ├── ssh_client.py             # Wrapper paramiko: SSH, SFTP, ejecución remota, keepalive
+│   ├── profiles.py               # Perfiles de servidor (servers.json, escritura atómica)
+│   ├── pg_exec.py                # Comandos psql/pg_dump para host o contenedor Docker
+│   ├── docker_manager.py         # Detección de contenedores con PostgreSQL
+│   ├── db_manager.py             # pg_dump en servidor remoto
+│   ├── filestore_manager.py      # Descubrimiento y empaquetado (tar) del filestore
+│   ├── bundle_manager.py         # Paquete .tar de artefactos (destino local/remoto)
+│   ├── transfer.py               # SFTP local y servidor-servidor (rsync --partial o scp)
+│   ├── gdrive.py                 # Subida a Drive: streaming, checkpoint, reintentos, watchdogs
+│   ├── remote_upload_manager.py  # Subida directa servidor → Drive con rclone
+│   ├── temp_registry.py          # Manifiesto de temporales en /tmp y barrido de huérfanos
+│   ├── scheduler.py              # Reglas programadas (ScheduleManager) y programador (BackupScheduler)
+│   ├── history_manager.py        # Historial persistente (connection_history.jsonl)
+│   ├── notifier.py               # Notificaciones de Windows
+│   ├── health_probe.py           # Sondeo de salud de solo lectura
+│   ├── health_eval.py            # Reglas puras: muestras + historial → nivel y hallazgos
+│   ├── alerting.py               # Correo SMTP, alertas por cambio de estado y resumen diario
+│   ├── monitor.py                # HealthMonitor: sondeo, evaluación y alertas desde el programador
+│   ├── instance_lock.py          # Un solo dueño del programador (GUI o monitor)
+│   ├── headless.py               # Modo sin ventana (--headless)
+│   ├── background_service.py     # Interruptor del monitor en segundo plano (HKCU Run + PID)
+│   ├── restore_manager.py        # Restauración completa BD + filestore + neutralización
+│   ├── addons_manager.py         # Clone/pull desde Git con autenticación por llave
+│   ├── inventory_manager.py      # Captura de métricas del sistema (snapshot JSON)
+│   ├── trial_manager.py          # Actualización de parámetros database.* en Odoo
+│   ├── file_browser.py           # Filesystem remoto vía SFTP (stat, chmod, mv, rm, subida)
+│   ├── updater.py / version.py   # Versión de la aplicación y consulta de nuevas versiones
+│   └── api/                      # Conexiones API
+│       ├── connections.py        #   Perfiles (api_connections.json, sin claves)
+│       ├── credentials.py        #   Administrador de credenciales de Windows
+│       ├── connectors.py         #   Un conector por tipo de sistema (odoo_json2, rest_bearer)
+│       └── realnet_board.py      #   Tablero de tareas y mesa de ayuda de realnet.com.co
+└── tests/                        # unittest, sin red ni ~/.odoo_backup_tool
 ```
+
+Para agregar un sistema externo nuevo basta con una subclase de `ApiConnector` registrada en `CONNECTOR_TYPES` (`core/api/connectors.py`). La página Conexiones API y `api_cli.py` la toman del registro.
 
 **Patrón de comunicación GUI ↔ Hilo de fondo:**
 
@@ -586,6 +699,11 @@ Todas las operaciones de red corren en hilos `daemon=True`. La GUI nunca se modi
 paramiko>=3.4.0
 Pillow>=10.0.0
 pyinstaller>=6.0.0
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
+google-auth-httplib2>=0.1.0
+plyer>=2.1.0
+tkinterdnd2>=0.4.2
 ```
 
 Instalar con:
@@ -598,6 +716,13 @@ pip install -r requirements.txt
 | `paramiko` | SSH, SFTP, PTY interactivo, generación y carga de llaves Ed25519/RSA/ECDSA |
 | `Pillow` | Generación de íconos 16×16 en el explorador de archivos |
 | `pyinstaller` | Solo para compilar el ejecutable distribuible |
+| `google-api-python-client`, `google-auth`, `google-auth-httplib2` | Destino Google Drive (Service Account) |
+| `plyer` | Notificaciones de Windows al terminar un respaldo programado |
+| `tkinterdnd2` | Arrastrar y soltar archivos de Windows en el Explorador |
+
+Las conexiones API (`core/api/`) no agregan dependencias: usan `urllib` y `ctypes` (Administrador de credenciales de Windows).
+
+En el servidor, la **subida directa a Drive** de una regla requiere `rclone`. Si no está disponible, la regla usa el modo relé.
 
 **Dependencias estándar de Python** (sin instalación adicional): `tkinter`, `threading`, `queue`, `json`, `os`, `datetime`, `re`, `uuid`, `socket`, `io`, `stat`, `posixpath`
 
@@ -660,6 +785,8 @@ Solo **una** instancia ejecuta el programador. Mientras la ventana está abierta
 
 `build.bat` cierra todas las instancias de `OdooBackupTool.exe`, incluido el monitor. Después de compilar, inícielo de nuevo con **Iniciar ahora** en **Configuración**, o cerrando e iniciando sesión.
 
+> **IMPORTANTE: el equipo debe estar encendido y SIN suspensión.** El monitor es un proceso de este equipo. Si Windows se suspende (por inactividad, de noche o el fin de semana), no corre ningún respaldo ni se envía ninguna alerta hasta que el equipo despierta. Ejemplo: del 24 al 26-oct-2026 no hubo respaldos porque el equipo estuvo suspendido. Configure *Suspender: nunca* con el equipo conectado a la corriente, o ejecute el monitor en un equipo que permanezca encendido.
+
 ### Abrir sin programador
 
 ```powershell
@@ -670,18 +797,75 @@ Abre la ventana sin ejecutar reglas, barrido de temporales ni alertas. Útil par
 
 ---
 
+## 14. Línea de comandos de conexiones API (`api_cli.py`)
+
+Interfaz de texto para las conexiones API y para el tablero de tareas y la mesa de ayuda de `realnet.com.co`. Pensada para la terminal y para Claude Code: devuelve texto corto en vez de requerir el navegador. **Se ejecuta desde el código fuente**, porque el `.exe` no tiene consola:
+
+```powershell
+cd C:\REALNET\tools\odoo_backup_tool
+$py = "C:\Users\Marketing Realnet\AppData\Local\Programs\Python\Python310\python.exe"
+& $py api_cli.py --help
+```
+
+> **SEGURIDAD: toda escritura es una vista previa.** Cada comando que modifica algo imprime `PREVIEW` y termina con código de salida **3** sin cambiar nada. Solo se aplica al repetirlo con `--yes`, después de que la persona revisó la vista previa.
+
+**Conexiones** (`conn`):
+
+| Comando | Acción |
+|---|---|
+| `conn list` / `conn show <nombre>` | Listar conexiones o ver una |
+| `conn add <nombre> --type odoo_json2\|rest_bearer --url ... [--database ...] [--user ...] [--board-defaults]` | Crear una conexión. `--board-defaults` carga los parámetros del tablero Realnet |
+| `conn set-key <nombre>` | Pedir la clave sin mostrarla y guardarla en el Administrador de credenciales. **Ejecútelo usted mismo** en una terminal |
+| `conn test <nombre>` | Probar la conexión |
+| `conn delete <nombre> --yes` | Eliminar la conexión |
+
+**Tablero de tareas** (`board task`, conexión `realnet` salvo que se indique `-c <conexión>`):
+
+| Comando | Acción |
+|---|---|
+| `task new "Título"` | Crear la tarjeta en `Nuevo` |
+| `task plan ID --deadline "AAAA-MM-DD HH:MM" --start "..." --hours HH:MM --desc "..."` | Planear la tarjeta. Escribe la fecha límite **antes** que la de inicio (orden que exige Odoo en este proyecto) y verifica el resultado |
+| `task start ID` | Iniciar el cronómetro |
+| `task stop ID --desc "lo que se hizo"` [`--discard`] | Detener y registrar el tiempo (o descartarlo) |
+| `task done ID` | Asignar el empleado correcto en cada línea de horas y pasar a `Finalizado` |
+| `task show ID` / `task list [--stage Nuevo] [--limit N]` | Consultar |
+
+El usuario de la API no tiene empleado en la compañía, así que Odoo oculta su cronómetro. Por eso el CLI usa un **cronómetro local** (`~/.odoo_backup_tool/api_timers.json`) y al detenerlo crea la línea de horas directamente con el empleado correcto.
+
+**Mesa de ayuda** (`board ticket`, solo lectura):
+
+| Comando | Acción |
+|---|---|
+| `ticket n3` | Tickets escalados a N3 - Desarrollo |
+| `ticket show ID [--full]` | Detalle de un ticket |
+| `ticket news --since "AAAA-MM-DD[ HH:MM]"` | Mensajes nuevos desde una fecha |
+| `ticket sla` | Estado de SLA |
+
+---
+
 ## Configuración persistente
 
 | Archivo | Contenido |
 |---|---|
-| `~/.odoo_backup_tool/servers.json` | Perfiles de servidor guardados |
+| `~/.odoo_backup_tool/servers.json` | Perfiles de servidor guardados (incluye contraseñas en texto plano) |
+| `~/.odoo_backup_tool/schedules.json` | Reglas programadas y su último resultado |
 | `~/.odoo_backup_tool/settings.json` | Geometría de ventana y posición del divisor del log |
-| `~/.odoo_backup_tool/monitor_settings.json` | Umbrales, intervalo de sondeo y cuenta de correo de alertas |
+| `~/.odoo_backup_tool/connection_history.jsonl` | Historial de conexiones y acciones (últimas 500) |
+| `~/.odoo_backup_tool/remote_tmp_manifest.json` | Temporales en `/tmp` de los servidores pendientes de limpieza |
+| `~/.odoo_backup_tool/upload_checkpoints/` | Puntos de reanudación de subidas a Drive interrumpidas |
+| `~/.odoo_backup_tool/monitor_settings.json` | Umbrales, intervalo de sondeo y cuenta de correo de alertas (incluye la contraseña SMTP en texto plano) |
 | `~/.odoo_backup_tool/monitor_state.json` | Historial de respaldos por regla y alertas ya notificadas |
 | `~/.odoo_backup_tool/health_metrics.jsonl` | Muestras de salud de los servidores (180 días) |
-| `~/.odoo_backup_tool/headless.log` | Registro del monitor en segundo plano |
+| `~/.odoo_backup_tool/headless.log` / `headless.pid` | Registro y PID del monitor en segundo plano |
+| `~/.odoo_backup_tool/scheduler.lock` / `.info` | Qué instancia ejecuta el programador (ventana o monitor) |
+| `~/.odoo_backup_tool/run_requests/` | Pedidos de "Ejecutar ahora" de una ventana visor al monitor |
+| `~/.odoo_backup_tool/api_connections.json` | Conexiones API (URL, tipo, parámetros). **Sin claves** |
+| `~/.odoo_backup_tool/api_timers.json` | Cronómetros locales de `api_cli.py board task start` |
+| Administrador de credenciales de Windows → `odoo_backup_tool/api/<nombre>` | Claves de las conexiones API |
 | `~/.odoo_backup_tool/inventories/` | Inventarios JSON de backups con destino remoto |
 | `~/.ssh/{nombre_llave}` | Llaves Ed25519 generadas desde Tab 7 (modo 0600) |
+
+> **Seguridad:** `servers.json`, `monitor_settings.json` y `remote_tmp_manifest.json` contienen contraseñas. No los comparta ni los suba a control de versiones.
 
 ---
 
