@@ -2,7 +2,7 @@
 
 Herramienta de escritorio para **respaldar, restaurar y administrar instancias Odoo** en servidores Linux remotos, sin necesidad de acceso directo al servidor. Opera completamente a través de SSH/SFTP desde una máquina Windows o Linux.
 
-![Odoo Backup Tool — Vista general](docs/screenshot_main.png)
+![Odoo Backup Tool — Vista general](docs/screenshot_panel_2026-10.png)
 > Panel de clientes con la barra lateral (octubre 2026). La IP y la BD del diagnóstico se reemplazaron por valores de ejemplo.
 
 ---
