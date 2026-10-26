@@ -715,12 +715,16 @@ class BackupScheduler:
                 dump_name = f"odoo_{db_name}_{ts}.{ext}"
                 dump_path = f"/tmp/{dump_name}"
                 log(f"[{label}] Generando dump: {dump_path}")
+                # Register BEFORE creating: if the connection drops mid-dump,
+                # the partial file must already be in the manifest so the
+                # orphan sweep removes it (incident 2026-10-24, equiredes).
+                _register(dump_path, "dump")
                 dump_path = db_mgr.create_dump(
                     db_name, fmt, dump_path,
                     log_callback=log,
                 )
                 remote_tmp.append(dump_path)
-                _register(dump_path, "dump")
+                # _register(dump_path, "dump")
                 log(f"[{label}] Dump listo: {dump_path}")
 
             if rule.get("include_filestore") and rule.get("filestore_root"):
@@ -728,12 +732,15 @@ class BackupScheduler:
                 zip_name = f"filestore_{db_name}_{ts}.tar"
                 zip_path = f"/tmp/{zip_name}"
                 log(f"[{label}] Empaquetando filestore: {zip_path}")
+                # Register BEFORE creating: a tar cut off by a dropped SSH
+                # session left 11.6 GB untracked in /tmp on 2026-10-24.
+                _register(zip_path, "filestore")
                 zip_path = fs_mgr.compress_filestore(
                     rule["filestore_root"], fs_db, zip_path,
                     log_callback=log,
                 )
                 remote_tmp.append(zip_path)
-                _register(zip_path, "filestore")
+                # _register(zip_path, "filestore")
                 log(f"[{label}] Filestore comprimido: {zip_path}")
 
             if not remote_tmp:
@@ -790,8 +797,9 @@ class BackupScheduler:
                     _register(inv_remote_path, "inventory")
 
                     all_files = remote_tmp + [inv_remote_path]
+                    _register(bundle_path, "bundle")  # before creating, see dump above
                     bm.create(bundle_path, all_files, log_callback=log)
-                    _register(bundle_path, "bundle")
+                    # _register(bundle_path, "bundle")
 
                     # Remove the individual files — bundle is the single deliverable
                     for f in all_files:

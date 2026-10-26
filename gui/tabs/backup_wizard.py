@@ -1522,6 +1522,9 @@ class BackupWizardMixin:
                         self._q.put(("btn_enable", None))
                         return
 
+                # Register BEFORE creating so a dump cut off by a dropped
+                # connection or a cancel is still swept from /tmp later.
+                _register(f"/tmp/{dump_fname}", "dump")
                 dump_path = db_mgr.create_dump(
                     p["db"], p["fmt"],
                     remote_path=f"/tmp/{dump_fname}",
@@ -1529,7 +1532,7 @@ class BackupWizardMixin:
                     cancel_event=self._cancel_event,
                 )
                 remote_tmp.append(dump_path)
-                _register(dump_path, "dump")
+                # _register(dump_path, "dump")
                 final_dump_fname = dump_fname   # track resolved filename for inventory naming
                 advance(f"Dump listo: {dump_path}")
 
@@ -1547,6 +1550,7 @@ class BackupWizardMixin:
                         self._q.put(("btn_enable", None))
                         return
 
+                _register(f"/tmp/{zip_fname}", "filestore")  # before creating, see dump
                 fs_path = fs_mgr.compress_filestore(
                     p["fs_root"], p["fs_db"],
                     remote_zip=f"/tmp/{zip_fname}",
@@ -1554,7 +1558,7 @@ class BackupWizardMixin:
                     cancel_event=self._cancel_event,
                 )
                 remote_tmp.append(fs_path)
-                _register(fs_path, "filestore")
+                # _register(fs_path, "filestore")
                 advance(f"Filestore empaquetado: {fs_path}")
 
         except RuntimeError as exc:
@@ -1588,8 +1592,9 @@ class BackupWizardMixin:
                     self._log(f"Inventario escrito en servidor: {inv_remote_path}")
 
                 all_files = remote_tmp + ([inv_remote_path] if inv_remote_path else [])
+                _register(bundle_path_remote, "bundle")  # before creating, see dump
                 bm.create(bundle_path_remote, all_files, log_callback=self._log)
-                _register(bundle_path_remote, "bundle")
+                # _register(bundle_path_remote, "bundle")
 
                 # Remove individual files — they are now inside the .tar
                 db_mgr_cleanup = DBManager(self._ssh, target=self._pg_target_source)
