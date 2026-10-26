@@ -47,6 +47,11 @@ _SECTIONS: list[tuple[str, str]] = [
     ("tab6",        "Tab 6 — Restaurar"),
     ("tab7",        "Tab 7 — Addons / Git"),
     ("tab8",        "Tab 8 — Explorador"),
+    ("tab9",        "Tab 9 — Terminal"),
+    ("trial",       "Trial"),
+    ("automation",  "Reglas programadas"),
+    ("history",     "Historial"),
+    ("api",         "Conexiones API"),
     ("concepts",    "Conceptos Clave"),
     ("full_flow",   "Flujo Completo"),
     ("faq",         "Preguntas Frecuentes"),
@@ -348,8 +353,7 @@ class HelpWindow(tk.Toplevel):
         self._h1("Monitoreo y alertas")
         self._p(
             "Cada cliente con una regla de respaldo programado se vigila con el mismo perfil de "
-            "servidor que usa el respaldo. La barra lateral agrupa las páginas: Monitoreo, Respaldo "
-            "manual, Automatización y Servidor. La aplicación abre en el Panel de clientes."
+            "servidor que usa el respaldo. La aplicación abre en el Panel de clientes."
         )
         self._warn(
             "Motivo: en septiembre de 2026 el respaldo de un cliente falló 19 días seguidos por falta "
@@ -413,7 +417,16 @@ class HelpWindow(tk.Toplevel):
             "delega al monitor.",
         ])
         self._warn("Solo una instancia ejecuta el programador: nunca hay respaldos duplicados.")
+        self._warn(
+            "El equipo debe estar encendido y sin suspensión. Si Windows se suspende (de noche o el "
+            "fin de semana) no corre ningún respaldo ni se envía ninguna alerta hasta que despierta. "
+            "Configure «Suspender: nunca» con el equipo conectado a la corriente."
+        )
         self._note("Registro del monitor: ~/.odoo_backup_tool/headless.log")
+        self._note(
+            "Tras compilar con build.bat el monitor queda detenido: vuelva a iniciarlo con "
+            "«Iniciar ahora» en Configuración."
+        )
 
     def _section_intro(self) -> None:
         self._h1("Odoo Backup Tool")
@@ -426,7 +439,9 @@ class HelpWindow(tk.Toplevel):
         self._h2("Que hace esta herramienta")
         self._bullet([
             "Conectarse a un servidor Odoo via SSH y crear un dump de la base de datos (SQL o pg_custom).",
-            "Comprimir el filestore (adjuntos e imagenes) en un archivo ZIP.",
+            # "Comprimir el filestore (adjuntos e imagenes) en un archivo ZIP.",
+            "Empaquetar el filestore (adjuntos e imagenes) en un archivo .tar "
+            "(los respaldos antiguos en .zip se siguen restaurando).",
             "Transferir el backup a la maquina local, a otro servidor remoto, o a Google Drive.",
             "Generar un inventario JSON con el estado exacto del backup (tablas, archivos, modulos).",
             "Restaurar una base de datos e importar el filestore en un servidor de destino.",
@@ -436,7 +451,24 @@ class HelpWindow(tk.Toplevel):
             "Terminal SSH interactiva integrada (xterm-256color, historial de comandos).",
             "Monitorear la salud de los servidores de los clientes y avisar por correo antes de que "
             "un problema tumbe el servicio (ver «Monitoreo y alertas»).",
+            "Respaldos diarios automaticos por cliente (ver «Reglas programadas»).",
+            "Conectarse por API con otros sistemas, como el tablero de tareas de realnet.com.co "
+            "(ver «Conexiones API»).",
         ])
+
+        self._h2("Barra lateral")
+        self._p("Las paginas se agrupan en secciones:")
+        self._bullet([
+            "Monitoreo — Panel de clientes y Configuracion (monitor, umbrales y correo).",
+            "Respaldo manual — pasos 1 a 5: Conexion, Base de datos, Filestore, Destino y Ejecutar.",
+            "Automatizacion — Reglas programadas e Historial.",
+            "Servidor — Restaurar, Addons, Explorador, Terminal y Trial.",
+            "Integraciones — Conexiones API.",
+        ])
+        self._note(
+            "El contador junto a «Panel de clientes» indica cuantos clientes estan en alerta o "
+            "en critico. Los pasos 2 a 5 se habilitan al conectarse en el paso 1."
+        )
 
         self._h2("Requisitos previos")
         self._h3("Maquina local (donde corre la herramienta)")
@@ -489,8 +521,12 @@ class HelpWindow(tk.Toplevel):
 
         self._h2("Campos")
         self._bullet([
-            "Host / IP — Direccion del servidor (ej. 62.84.178.182).",
-            "Puerto — Puerto SSH (defecto 22; Bancasa usa 4322).",
+            # "Host / IP — Direccion del servidor (ej. 62.84.178.182).",
+            # "Puerto — Puerto SSH (defecto 22; Bancasa usa 4322).",
+            # Generic example values: this repository is public, so the help
+            # must not name a real client server or its SSH port.
+            "Host / IP — Direccion del servidor (ej. 203.0.113.10).",
+            "Puerto — Puerto SSH (defecto 22; algunos servidores usan otro, p. ej. 4322).",
             "Usuario — Usuario SSH con permisos sobre los datos de Odoo.",
             "Contrasena / Clave SSH — Autenticacion: contrasena directa o ruta a clave privada local (.pem, .key, ed25519).",
             "Passphrase — Si la clave privada esta cifrada, se solicita una sola vez y se guarda en memoria (nunca en disco).",
@@ -1001,32 +1037,199 @@ class HelpWindow(tk.Toplevel):
 
         self._h2("Operaciones disponibles por panel")
         self._bullet([
-            "Navegar — doble clic en directorio para entrar; boton '↑ Subir' para retroceder.",
-            "Inicio — va al directorio home del usuario SSH.",
-            "Actualizar — recarga el listado del directorio actual.",
-            "Nueva carpeta — crea un directorio en la ruta actual.",
-            "Eliminar — elimina el elemento seleccionado (archivo o directorio).",
-            "Copiar nombre — copia al portapapeles el nombre del elemento seleccionado.",
-            "Tamano — calcula el espacio de los directorios via 'du -sh' (puede tardar).",
+            "Navegar — doble clic en un directorio para entrar; ◀ ▶ historial, ▲ subir, ⌂ inicio.",
+            "↺ F5 — recarga el listado del directorio actual. «Mostrar ocultos» incluye archivos con punto.",
+            "Menu contextual (clic derecho): Abrir / Entrar, Copiar o Mover al otro panel, Descargar, "
+            "Nueva carpeta, Renombrar (F2), Eliminar (Del), Permisos (chmod), Propiedades, "
+            "Copiar nombre al portapapeles.",
+            "Arrastrar y soltar — suelte archivos o carpetas desde el Explorador de Windows para "
+            "subirlos a la carpeta remota actual (pide confirmacion).",
         ])
+        # self._bullet([
+        #     "Navegar — doble clic en directorio para entrar; boton '↑ Subir' para retroceder.",
+        #     "Inicio — va al directorio home del usuario SSH.",
+        #     "Actualizar — recarga el listado del directorio actual.",
+        #     "Nueva carpeta — crea un directorio en la ruta actual.",
+        #     "Eliminar — elimina el elemento seleccionado (archivo o directorio).",
+        #     "Copiar nombre — copia al portapapeles el nombre del elemento seleccionado.",
+        #     "Tamano — calcula el espacio de los directorios via 'du -sh' (puede tardar).",
+        # ])
 
         self._h2("Informacion mostrada por archivo/directorio")
         self._bullet([
             "Nombre del archivo o directorio.",
-            "Tamano (para archivos: en tiempo real; para directorios: bajo demanda con 'Tamano').",
+            "Tamano de los archivos (el de las carpetas no se calcula).",
             "Fecha de ultima modificacion.",
             "Permisos unix (rwxrwxrwx).",
         ])
 
+        # self._warn(
+        #     "La eliminacion de directorios es recursiva (equivalente a rm -rf). "
+        #     "No hay confirmacion adicional. Asegurese de seleccionar el elemento correcto."
+        # )
         self._warn(
-            "La eliminacion de directorios es recursiva (equivalente a rm -rf). "
-            "No hay confirmacion adicional. Asegurese de seleccionar el elemento correcto."
+            "La eliminacion de directorios es recursiva (equivalente a rm -rf). Se pide una sola "
+            "confirmacion: verifique que el elemento seleccionado es el correcto."
         )
 
         self._note(
             "El explorador es util para liberar espacio en el servidor antes de una restauracion, "
             "verificar que los archivos de backup llegaron correctamente, o inspeccionar "
             "el filestore de una instancia restaurada."
+        )
+
+    # ── Tab 9 ────────────────────────────────────────────────────────────────
+
+    def _section_tab9(self) -> None:
+        self._h1("Tab 9 — Terminal SSH")
+        self._h2("Proposito")
+        self._p(
+            "Terminal SSH interactiva (PTY real) en dos paneles: el izquierdo en el servidor "
+            "origen (paso 1) y el derecho en el Servidor B (Restaurar) o en el destino del respaldo."
+        )
+        self._bullet([
+            "Se conecta sola al entrar si ya hay sesiones SSH activas.",
+            "xterm-256color, 220 columnas x 50 filas; el estado del shell (cd, variables) se mantiene.",
+            "Historial de comandos con ↑ / ↓ y buffer de 5000 lineas.",
+            "Botones Ctrl+C (interrumpe el proceso remoto), Limpiar, Reconectar y Desconectar.",
+            "Resalta INFO, WARNING y ERROR en la salida.",
+        ])
+        self._note(
+            "Los colores ANSI se filtran y el historial de comandos no se guarda al cerrar la "
+            "herramienta. Cada sesion queda en el Historial (tipo «Terminal SSH»)."
+        )
+
+    # ── Trial ────────────────────────────────────────────────────────────────
+
+    def _section_trial(self) -> None:
+        self._h1("Trial — Licencia de prueba")
+        self._h2("Proposito")
+        self._p(
+            "Actualizar los parametros database.* de ir_config_parameter de una base de datos "
+            "Odoo para renovar el periodo de prueba."
+        )
+        self._warn("Modifica directamente ir_config_parameter y no tiene deshacer automatico.")
+        self._h2("Paso 1 — Obtener valores frescos")
+        self._bullet([
+            "Generar valores frescos: uuid4 para database.secret y database.uuid y la fecha actual; "
+            "no requiere servidor.",
+            "Crear BD Odoo limpia: crea obt_trial_tmp, inicializa Odoo y extrae sus valores "
+            "(2 a 5 minutos). Incluye boton para eliminar la BD temporal.",
+        ])
+        self._h2("Paso 2 — Aplicar en la BD objetivo")
+        self._bullet([
+            "«Consultar BD objetivo» muestra los valores actuales.",
+            "«Aplicar valores Trial» (con confirmacion) actualiza secret, uuid y create_date y "
+            "elimina expiration_date y expiration_reason.",
+        ])
+        self._note(
+            "Con un contenedor Docker seleccionado («Detectar contenedores»), todas las operaciones "
+            "se ejecutan con docker exec dentro del contenedor."
+        )
+
+    # ── Automation ───────────────────────────────────────────────────────────
+
+    def _section_automation(self) -> None:
+        self._h1("Reglas programadas")
+        self._h2("Proposito")
+        self._p(
+            "Respaldos diarios automaticos por cliente. Cada regla respalda una BD (dump + filestore) "
+            "hacia un destino a una hora fija."
+        )
+        self._h2("Lista y botones")
+        self._p("Columnas: #, Habilitado, Cliente, BD, Destino, Hora, Proximo y Ultimo resultado.")
+        self._bullet([
+            "«+ Agregar» / «Editar» — abre el dialogo de la regla.",
+            "«Eliminar» — borra la regla (con confirmacion).",
+            "«▶ Ejecutar ahora» — lanza la regla de inmediato.",
+            "«⏸ Pausar» / «▶ Reanudar» — detiene o reanuda todo el programador.",
+        ])
+        self._h2("Campos de la regla")
+        self._bullet([
+            "Nombre, perfil del servidor, BD y formato.",
+            "Incluir dump / incluir filestore (ruta raiz y carpeta de la BD).",
+            "Hora de ejecucion (HH MM) y destino: Google Drive, directorio local o servidor remoto.",
+            "Retencion en dias (0 = sin limite).",
+            "«Limpiar /tmp/ del servidor al terminar» y «Regla habilitada».",
+            "Drive: JSON de la Service Account e ID de la carpeta. «Subida directa servidor -> Drive "
+            "(rclone)» sube sin pasar por esta maquina; si no es posible, usa el modo relé.",
+        ])
+        self._h2("Comportamiento")
+        self._bullet([
+            "Solo corre con una instancia abierta (ventana o monitor en segundo plano).",
+            "Si varias reglas vencen a la vez, arrancan escalonadas cada 120 s; como maximo hay "
+            "2 subidas a Drive simultaneas.",
+            "«Ejecutar ahora» no duplica una regla que ya esta corriendo.",
+            "Para Drive, dump, filestore e inventario se suben en paralelo; la retencion borra los "
+            "archivos mas antiguos. Un fallo de la retencion solo deja un [aviso].",
+            "Cada temporal de /tmp se anota antes de crearse: si el respaldo se interrumpe, el "
+            "parcial se borra en el siguiente arranque ([limpieza-huerfanos] en el log).",
+            "Al terminar se muestra una notificacion de Windows con el resultado.",
+        ])
+        self._warn(
+            "Si el equipo esta apagado o suspendido no corre ninguna regla. Al volver, las reglas "
+            "vencidas se disparan juntas."
+        )
+
+    # ── History ──────────────────────────────────────────────────────────────
+
+    def _section_history(self) -> None:
+        self._h1("Historial")
+        self._p(
+            "Registro persistente de lo que hizo la herramienta en los servidores: respaldos manuales "
+            "y programados, restauraciones, sincronizaciones de addons y sesiones de terminal."
+        )
+        self._bullet([
+            "Columnas: Fecha, Tipo, Servidor, Resultado y Resumen.",
+            "Filtro «Tipo»: Todos, Backup manual, Backup programado, Restauracion, Sync addons, "
+            "Terminal SSH.",
+            "«Ver detalle» (o doble clic) muestra el log completo de esa ejecucion.",
+            "«Actualizar» relee el archivo.",
+        ])
+        self._note(
+            "Se guardan las ultimas 500 entradas en ~/.odoo_backup_tool/connection_history.jsonl. "
+            "Es el lugar para revisar por que fallo un respaldo de dias anteriores."
+        )
+
+    # ── API connections ──────────────────────────────────────────────────────
+
+    def _section_api(self) -> None:
+        self._h1("Conexiones API")
+        self._h2("Proposito")
+        self._p(
+            "Conectar la herramienta con sistemas externos por API. Hoy se usa para el tablero de "
+            "tareas y la mesa de ayuda de realnet.com.co (conexion «realnet»)."
+        )
+        self._h2("Pagina")
+        self._bullet([
+            "Izquierda: lista de conexiones (Nombre, Tipo, URL). Derecha: detalle de la seleccionada.",
+            "Campos: Nombre, Tipo, URL base, Usuario de la clave, parametros del tipo, "
+            "Parametros (JSON) y Notas.",
+            "Botones: Nueva, Guardar, Eliminar, «Guardar clave...» y «Probar conexion».",
+        ])
+        self._h2("Tipos")
+        self._bullet([
+            "Odoo 19+ (JSON-2): POST /json/2/<modelo>/<metodo> con la API key como bearer; requiere "
+            "la base de datos. Aplica los mismos permisos que el cliente web.",
+            "REST generico (Bearer token): cualquier API JSON con Authorization: Bearer; la prueba "
+            "hace un GET a la ruta indicada.",
+        ])
+        self._warn(
+            "Las claves NO se guardan en api_connections.json: van al Administrador de credenciales "
+            "de Windows (odoo_backup_tool/api/<nombre>) o en la variable OBT_API_KEY_<NOMBRE>."
+        )
+        self._h2("Linea de comandos")
+        self._p("api_cli.py expone lo mismo desde una terminal (se ejecuta desde el codigo fuente):")
+        self._code(
+            "python api_cli.py conn list | conn test realnet\n"
+            "python api_cli.py board task new \"Titulo\"\n"
+            "python api_cli.py board task plan ID --deadline ... --start ... --hours HH:MM --desc ...\n"
+            "python api_cli.py board task start|stop|done ID\n"
+            "python api_cli.py board ticket n3 | ticket show ID | ticket news --since AAAA-MM-DD"
+        )
+        self._ok(
+            "Toda escritura imprime PREVIEW y no cambia nada (codigo de salida 3) hasta repetirla "
+            "con --yes."
         )
 
     # ── Concepts ─────────────────────────────────────────────────────────────
