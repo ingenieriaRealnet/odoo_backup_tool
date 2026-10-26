@@ -11,7 +11,8 @@ Compilada a `.exe` con PyInstaller (`--onefile --windowed`). Branch activo: `dev
 
 | Componente | Detalle |
 |---|---|
-| GUI | `tkinter` / `ttk`, 11 tabs, `queue.Queue` para actualizaciones thread-safe |
+| GUI | `tkinter` / `ttk`, 14 páginas con navegación lateral, `queue.Queue` para actualizaciones thread-safe |
+| Monitoreo | Sondeo SSH de solo lectura + alertas por correo (`smtplib`), sin dependencias nuevas |
 | SSH / SFTP | `paramiko` |
 | Google Drive | `google-api-python-client`, Service Account JSON, upload resumable |
 | Transferencia S2S | `rsync --partial` (preferido) con fallback a `scp`; `sshpass -e` |
@@ -34,9 +35,30 @@ odoo_backup_tool/
 │   ├── profiles.py        # CRUD perfiles en servers.json
 │   ├── notifier.py        # Toast Windows via plyer
 │   ├── temp_registry.py   # Manifiesto de temporales /tmp remotos + barrido de huerfanos
-│   └── restore_manager.py
+│   ├── restore_manager.py
+│   ├── health_probe.py    # Sondeo de solo lectura (disco, PostgreSQL, Odoo) + HealthStore (JSONL)
+│   ├── health_eval.py     # Reglas puras: muestras + historial de respaldos -> nivel y hallazgos
+│   ├── alerting.py        # MonitorSettings, envío SMTP, AlertManager (cambios de estado, resumen diario)
+│   ├── monitor.py         # HealthMonitor: orquesta sondeo/evaluación/alertas desde el tick del scheduler
+│   ├── instance_lock.py   # SchedulerLock: una sola instancia ejecuta el programador
+│   ├── headless.py        # Modo sin ventana (--headless)
+│   ├── background_service.py  # Interruptor del modo sin ventana: HKCU Run + PID (headless.pid)
+│   └── api/               # Conexiones API: connections.py (api_connections.json), credentials.py
+│                          #   (Administrador de credenciales), connectors.py (odoo_json2, rest_bearer),
+│                          #   realnet_board.py (tablero de tareas + mesa de ayuda de realnet.com.co)
 ├── gui/
-│   └── app.py             # BackupApp: 5000+ líneas, todo el wizard
+│   ├── app.py             # BackupApp: ventana, tema, barra de estado, log, cola, cierre
+│   ├── constants.py       # Constantes de la ventana (antes al inicio de app.py)
+│   ├── theme.py           # Paleta y fuentes (fuente única)
+│   ├── dialogs.py         # _OverwriteDialog, _ScheduleDialog
+│   ├── sidebar.py         # Navegación lateral (maneja el Notebook oculto)
+│   ├── health_panel.py    # Página "Panel de clientes" (dashboard)
+│   ├── alerts_panel.py    # Página "Configuración" del monitor: segundo plano, umbrales y correo
+│   ├── api_panel.py       # Página "Conexiones API" (Integraciones)
+│   └── tabs/              # Un mixin de BackupApp por área: backup_wizard, restore, addons,
+│                          #   server_tools, automation, monitoring_pages, integrations
+├── tests/                 # unittest: monitoreo, alertas, scheduler compartido, headless
+├── api_cli.py             # CLI de conexiones API y del tablero Realnet (se ejecuta desde fuente)
 ├── OdooBackupTool.spec    # Config PyInstaller
 ├── build.bat              # Script de compilación
 ├── requirements.txt
@@ -48,8 +70,21 @@ odoo_backup_tool/
 
 ```powershell
 # Desde C:\REALNET\tools\odoo_backup_tool
-& "C:\Users\Marketing Realnet\AppData\Local\Programs\Python\Python310\python.exe" -m gui.app
+$py = "C:\Users\Marketing Realnet\AppData\Local\Programs\Python\Python310\python.exe"
+
+# SIEMPRE con --no-scheduler si el .exe de producción está abierto: una segunda
+# instancia con programador dispararía cada regla dos veces y su barrido de
+# huérfanos borraría los temporales de un job en curso.
+& $py main.py --no-scheduler
 ```
+
+## Cómo correr las pruebas
+
+```powershell
+& $py -m unittest discover -s tests
+```
+
+No tocan la red ni `~/.odoo_backup_tool` (directorios temporales y sondeos simulados).
 
 ## Cómo compilar
 
@@ -63,6 +98,8 @@ odoo_backup_tool/
 ```powershell
 $py = "C:\Users\Marketing Realnet\AppData\Local\Programs\Python\Python310\python.exe"
 & $py -m py_compile core/gdrive.py core/scheduler.py core/transfer.py gui/app.py
+# Nombres no definidos (p. ej. tras mover código entre módulos):
+& $py -m pyflakes core gui main.py
 ```
 
 ## Datos persistentes en tiempo de ejecución
@@ -75,6 +112,13 @@ Todos los archivos de usuario se guardan en `~/.odoo_backup_tool/`:
 | `schedules.json` | Reglas de automatización |
 | `upload_checkpoints/*.json` | Checkpoints de uploads Drive interrumpidos |
 | `remote_tmp_manifest.json` | Manifiesto de archivos /tmp remotos pendientes de limpieza (ver `core/temp_registry.py`) |
+| `health_metrics.jsonl` | Muestras de salud por servidor (append-only, 180 días) |
+| `monitor_state.json` | Historial de respaldos por regla (fallos seguidos, último OK) y alertas ya notificadas |
+| `monitor_settings.json` | Umbrales, intervalo de sondeo y cuenta SMTP de alertas |
+| `scheduler.lock` / `.info` | Quién ejecuta el programador (GUI o monitor en segundo plano) |
+| `run_requests/*.req` | "Ejecutar ahora" pedido por una ventana que no es dueña del programador |
+| `headless.log` | Log del modo `--headless` (rotativo) |
+| `api_connections.json` | Conexiones API (URL, tipo, parámetros). SIN claves: van al Administrador de credenciales de Windows (`odoo_backup_tool/api/<nombre>`) |
 
 ## Convenciones de código
 
@@ -117,6 +161,7 @@ Phase B (transferencia):
 - **`_on_close()` distingue trabajo activo de trabajo congelado** antes de pedir confirmación: `self._last_activity_ts` (gui/app.py) se refresca en cada evento drenado por `_poll_queue()` (log/progress/sched_log, manual y programado por igual, misma cola). Si hay un backup manual (`_btn_run` disabled) o una regla programada activa (`BackupScheduler.has_active_jobs()`) Y la última actividad fue hace menos de `_FROZEN_ACTIVITY_THRESHOLD_SECS` (90s) → pide confirmación antes de cerrar. Si está "corriendo" pero sin ninguna actividad en más de 90s (congelado/colgado) → cierra directo sin preguntar, porque no hay nada real que interrumpir.
 - **Passphrase de llave SSH del servidor (Tab 7 Addons)**: cuando el modo de llave es "Llave del servidor", `AddonsManager.server_key_needs_passphrase()` pregunta al servidor (via `ssh-keygen -y`, sin transferir la llave) si esta protegida; si lo esta, `_action_sync_addons` pide la passphrase por dialogo (cacheada en `self._server_key_passphrases` por `host:ruta`, igual que las llaves locales) y `AddonsManager.unlock_server_key()` la desbloquea en un `ssh-agent` **en el propio servidor** via un script SSH_ASKPASS de un solo uso — la llave nunca sale del servidor. El `env_prefix` resultante (`SSH_AUTH_SOCK=...`) se antepone a los comandos git en `sync()`/`_sync_submodules()`. Antes, una llave del servidor con passphrase fallaba en silencio porque `BatchMode=yes` no puede pedir la passphrase de forma no interactiva.
 - **Registro de temporales remotos y barrido de huérfanos** (`core/temp_registry.py`, `RemoteTempRegistry` + `sweep_orphaned_files`): cada dump/filestore/bundle/inventory que la herramienta crea en `/tmp` de un servidor remoto se registra en `~/.odoo_backup_tool/remote_tmp_manifest.json` (host/puerto/usuario/password/ruta/kind/label/fecha) ANTES de que la conexión que lo creó pueda cerrarse, y se des-registra solo cuando ese archivo se elimina con éxito del servidor. Como el manifiesto vive en disco (no en memoria), sobrevive a un crash, un cierre forzado, o un job que falla sin llegar a su propio código de limpieza. Instancia única compartida entre `BackupApp` (`self._temp_registry`) y `BackupScheduler` (pasado como `temp_registry=` en el constructor) — dos instancias independientes se pisarían el archivo entre sí. Si una regla/backup manual tiene `cleanup_server`/`cleanup=False` (el usuario quiere conservar el archivo a propósito), se des-registra sin borrar — el barrido nunca debe eliminar algo dejado intencionalmente. El barrido corre en un hilo de fondo al iniciar la app (`BackupApp._sweep_orphaned_temp_files`), agrupado por servidor, con un margen de `_MIN_AGE_FOR_SWEEP_SECS` (10 min) para no competir con un job que todavía podría estar corriendo legítimamente. Un servidor inalcanzable durante el barrido deja sus entradas intactas para reintentar en el próximo arranque.
+- **Registrar el temporal ANTES de crearlo** (`scheduler.py._run_rule`, `gui/tabs/backup_wizard.py`; incidente `backup_equiredes` 2026-10-24): el dump, el filestore y el bundle se registraban recién cuando `create_dump`/`compress_filestore`/`bm.create` terminaban. Una caída de red local cortó las sesiones SSH a mitad del `tar` y el `.tar` parcial de 11,6 GB nunca entró al manifiesto, así que el barrido del arranque siguiente no lo borró. Ahora `_register()` va antes de crear cada archivo; si el archivo nunca llegó a existir, el `rm -f` del barrido no falla. Prueba: `tests/test_temp_registration.py`.
 - **Fix `burst_index` inflado por jobs zombie** (`scheduler.py._tick`): las reglas todavía activas (`_active_jobs` vivo) ya NO cuentan para el índice de ráfaga — antes, un job que seguía corriendo horas después de iniciar (p.ej. una subida grande sin terminar, con `last_run_ts` sin actualizar) se seguía viendo "vencido" en cada tick posterior e inflaba el `burst_index` de reglas totalmente ajenas que en realidad llegaban solas a su hora, dándoles un retraso injustificado de `_burst_stagger_secs`. Confirmado en el log 2026-07-17: equiredes/novalens/variedades cada una recibió un "en cola... 120s" sin haber coincidido realmente con otra regla nueva, solo porque bancasa seguía "viva" desde las 9am.
 - **Watchdog de progreso real (`_StallWatchdog` en `gdrive.py`)**: el timeout de socket de 120s solo detecta una conexión completamente silenciosa — no detecta una que sigue "respirando" (suficientes bytes para resetear ese timeout) sin avanzar realmente. Confirmado dos veces el 2026-07-17: `novalens` colgado 44 min → `HttpError 200 "OK"`, y `variedades` colgado 30 min → `Redirected but the response is missing a Location header`, ambos sin ninguna línea de progreso durante el colgado. `_StallWatchdog` corre en un hilo aparte durante `upload_stream()`/`upload_file()`; si pasan `_MAX_STALL_SECS` (240s) sin que se complete un chunk (`touch()`), cierra a la fuerza el socket HTTP subyacente (via `svc._http.http.connections`) para que la llamada bloqueada falle de inmediato con un error de conexión — que `_with_retry` ya sabe reintentar reanudando desde el offset confirmado. `_NETWORK_RETRYABLE` ahora incluye `OSError` genérico porque la desconexión forzada no siempre produce un tipo de excepción más específico (en Windows típicamente `WinError 10038`).
 - **Fix `tar: file changed as we read it` no debe abortar el backup** (`filestore_manager.py.compress_filestore`): GNU tar sale con código 1 (advertencia, no fatal) cuando un archivo cambia mientras se lee — normal en un filestore de Odoo activo durante horario laboral. El comando ahora usa `tar -cf ...; test $? -le 1` para que solo un código de salida ≥2 (error real) aborte el backup; antes cualquier código distinto de 0 hacía fallar el job completo, perdiendo el backup entero por una advertencia inofensiva (confirmado en el log 2026-07-17, `backup_equiredes`).
@@ -124,3 +169,14 @@ Phase B (transferencia):
 - **Indicador visual al cerrar la app** (`gui/app.py._on_close`): se abre una ventanita ("Validando tareas pendientes..." → "Validando procesos antes de cerrar...") en el primer instante del clic en cerrar, forzada a pintarse (`update()`) antes de correr cualquier validación bloqueante. Antes, el usuario veía la ventana principal sin reaccionar durante los ~6s de cierre de conexiones SSH en paralelo, fácil de confundir con que el clic no registró o que la app está congelada.
 - **`HttpError 200 "OK"` y `'str' object has no attribute 'get'` no deben abortar una subida a Drive que en realidad sí se completó** (`gdrive.py`): confirmado en el log 2026-07-21 — `backup_equiredes` y `backup_novalens` fallaron con `HttpError 200 "OK"` (colgados ~29-90 min antes), y `backup_mega` con `'str' object has no attribute 'get'`. Causa raíz: es un quirk conocido de `googleapiclient` — cuando `_StallWatchdog` fuerza una reconexión a mitad de un chunk, la sesión resumible a veces retoma con una respuesta de finalización mal formada (status 200 pero cuerpo no parseable como JSON, o el cuerpo crudo como `str` en vez del dict esperado) aunque el archivo ya se recibió correctamente en Drive. Dos fixes: (1) `_with_retry` ahora trata status 200/201 como reintentable (`_RETRYABLE_MALFORMED_STATUS`) en vez de abortar de inmediato — reintentar `next_chunk()` reconsulta el estado real; (2) si tras el loop `response` no es un `dict` utilizable, `_fetch_uploaded_file_meta()` busca el archivo por nombre+carpeta directamente en Drive en vez de crashear en `response.get(...)` — si tampoco lo encuentra ahí, lanza `RuntimeError` (nunca reporta éxito falso). También se agregó logging explícito: `_StallWatchdog` ahora loguea cada reconexión forzada (antes era silenciosa, lo que producía huecos de 29-90 min sin ninguna línea en el log) y `_with_retry` loguea el intento final antes de propagar la excepción, en vez de fallar en silencio.
 - **`_StallWatchdog` estaba matando subidas sanas-pero-lentas, no solo las colgadas** (`gdrive.py`): confirmado 2026-07-21 — el mismo día que se relajaron los fixes anteriores, las 5 reglas programadas fallaron 5/5 (antes de existir el watchdog, 0 fallaban por esta causa). El watchdog solo mide "chunk completo" (`touch()`), no bytes reales en tránsito, así que `_MAX_STALL_SECS / _CHUNK_SIZE` es un piso de throughput implícito no documentado como tal: con 240s/16MB, exigía ~68 KB/s sostenidos por stream o mataba la conexión creyéndola muerta, aunque siguiera avanzando más lento. El enlace de salida de la oficina estuvo por debajo de eso gran parte del día 21-jul, y el watchdog abortó cada intento de las 5 reglas. Subido `_MAX_STALL_SECS` a 600s y bajado `_CHUNK_SIZE` a 4MB (piso efectivo ahora ~7 KB/s) — sigue detectando los cuelgues reales confirmados el 17-jul (30-44 min), con mucho mas margen para tramos simplemente lentos.
+- **Monitoreo de salud de clientes** (`core/health_probe.py`, `health_eval.py`, `alerting.py`, `monitor.py`; incidente Variedades 2026-09-30): la regla `backup_variedades` falló 12 veces seguidas con "Espacio insuficiente en /tmp" (libre de 14 G a 1,8 G) durante 19 días antes de que el disco se llenara y tumbara PostgreSQL; el aviso solo existía en la pestaña Historial. Ahora `BackupScheduler._loop` le da turno a `HealthMonitor.maybe_run_cycle()` en cada tick (también con el programador pausado): sondea por SSH, con un solo comando de solo lectura, cada servidor con regla habilitada (`probe_interval_hours`, default 6), guarda la muestra y evalúa. `ScheduleManager.on_result` avisa al monitor de cada resultado para llevar fallos consecutivos y último OK en `monitor_state.json` (se siembra desde `connection_history.jsonl` la primera vez, porque el historial se poda a 500 entradas). Niveles: `ok` / `warn` / `crit` / `unknown` (sin datos frescos; nunca cierra una alerta) / `off`. Un solo respaldo fallido se muestra pero no alerta.
+- **Alertas** (`core/alerting.py`): `AlertManager.process` notifica solo cambios de estado (nueva, agravada, resuelta) y recuerda lo crítico cada `reminder_hours`; un correo por ciclo. Si el envío falla no se marca como notificado y se reintenta en el siguiente ciclo. El resumen diario (`digest_hour`) se envía aunque todo esté OK: es la señal de vida del monitor. La configuración va en `monitor_settings.json`, NO en `settings.json`, porque `_save_geometry` reescribe ese archivo completo al cerrar.
+- **Un solo dueño del programador** (`core/instance_lock.py`): la GUI y `--headless` contienen ambos un `BackupScheduler`; el que toma `scheduler.lock` (bloqueo de SO, no queda huérfano si el proceso muere) ejecuta reglas, barre huérfanos y envía alertas. El otro es visor: `HealthMonitor.owner=False` no escribe estado ni alerta, y "Ejecutar ahora" deja un archivo en `run_requests/` que el dueño consume en su siguiente tick. La GUI visor reintenta tomar el lock cada 60 s. `ScheduleManager` y `ProfileManager` recargan su JSON si cambió el mtime, para que el proceso headless vea las ediciones hechas en la GUI y no las pise al registrar un resultado.
+- **Modo sin ventana** (`main.py --headless`, `core/headless.py`): programador + monitor sin Tk, log en `headless.log`. Motivo: el programador solo corría con la app abierta y en el historial hay días sin ninguna ejecución (2026-09-17, 19-21, 26-27). Se activa y desactiva desde la página Configuración (`core/background_service.py`): escribe/borra el valor `OdooBackupToolMonitor` en `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (no requiere administrador, a diferencia de una tarea programada al inicio de sesión) e inicia/detiene el proceso. El proceso se identifica por `headless.pid`, escrito ANTES de esperar el lock para que también se vea el monitor que solo espera a que cierre la ventana; como Windows reutiliza PIDs, `running_pid()` además valida el nombre del ejecutable. OJO: `build.bat` hace `taskkill` de todo `OdooBackupTool.exe`, incluido el monitor; tras compilar hay que volver a iniciarlo con "Iniciar ahora".
+- **Navegación lateral y páginas** (`gui/sidebar.py`): el `ttk.Notebook` sigue conteniendo las páginas pero con la tira de pestañas oculta (`Hidden.TNotebook`); la barra lateral solo llama a `nb.select()`. Las páginas nuevas (Panel = 12, Configuración = 13) se agregan AL FINAL a propósito: el asistente y varios handlers direccionan páginas por número (`self.nb.select(4)`, `idx == 7`), así que insertar una página al inicio desplazaría todos esos índices. La barra lateral relee cada 800 ms qué páginas están deshabilitadas porque ttk no emite evento cuando cambia el `state` de una pestaña.
+- **División de `gui/app.py`** (2026-09-30): la clase única de 7.000 líneas se repartió en mixins por área (`gui/tabs/*`) sin reescribir nada; la equivalencia se comprobó comparando el AST de los 133 métodos antes y después. `BackupApp` hereda de todos los mixins, así que `self` sigue siendo el mismo objeto y los widgets creados por un mixin son visibles desde otro. Al agregar un método nuevo, ponerlo en el mixin de su página; lo transversal (cola, log, cierre) queda en `app.py`.
+- **Lambdas diferidas con la excepción** (`self.root.after(0, lambda: ...{exc}...)` dentro de `except ... as exc`): Python desliga `exc` al salir del bloque, antes de que Tk ejecute la lambda, y el mensaje real se perdía en un `NameError`. Se corrigieron 10 casos con `lambda exc=exc:`. `pyflakes` los reporta como "undefined name".
+- `_sched_append_log` se llamaba desde "Ejecutar ahora" pero no existía: el job arrancaba y el handler moría con `AttributeError`. Ya está definido en `gui/tabs/automation.py`.
+- **Ventana de ayuda no abría** (`gui/help_window.py`): el método `_configure()` tapaba `Misc._configure()` de tkinter, y el `self.configure(bg=...)` de adentro terminaba llamándolo con argumentos de más (`TypeError`). Renombrado a `_setup_window()`. No usar nombres de métodos internos de tkinter (`_configure`, `_options`, `_bind`, `_root`...) en subclases de widgets. La ayuda tiene ahora la sección "Monitoreo y alertas".
+- **La retención en Drive no debe anular un respaldo ya subido** (incidente `backup_equiredes` 2026-10-13): los 3 archivos se subieron y verificaron, pero un `HttpError 500` transitorio de Google en el `files().list()` de `cleanup_old_files` (no pasaba por `_with_retry`, solo el borrado) marcó la regla como error y, al saltar al `except`, dejó ~15 GB de temporales en `/tmp` del servidor. Ahora la consulta usa `_with_retry` y en `_run_rule` la retención va en su propio `try/except` que solo deja un `[aviso]`: el respaldo queda "ok", se limpia el servidor y la retención se reintenta en la siguiente ejecución. Prueba: `tests/test_gdrive_retention.py`.
+- **Conexiones API** (`core/api/`, página "Conexiones API" = 14, `api_cli.py`; 2026-10-14): extensión para conectar la herramienta con varios sistemas por API. Cada tipo de sistema es una clase de `connectors.py` registrada en `CONNECTOR_TYPES` (hoy `odoo_json2` para Odoo 19+ y `rest_bearer` genérico); agregar un sistema nuevo = una subclase de `ApiConnector`, la GUI y el CLI la toman del registro. Las claves NUNCA van a `api_connections.json`: `WindowsCredentialStore` (ctypes sobre advapi32, sin dependencias) o la variable `OBT_API_KEY_<NOMBRE>`. Primer uso: conexión `realnet` (realnet.com.co, BD `ingenieriarealnet-realnetsh-v19-30917601`) con `realnet_board.py`, que reemplaza el registro de tarjetas y la lectura de tickets por Chrome (motivo: ~1.500 capturas en 14 días eran el mayor consumo de tokens de Claude Code). En Odoo 19 XML-RPC está obsoleto: se usa JSON-2 (`/json/2/<modelo>/<método>`, API key como bearer). "Detener" reproduce el flujo de la UI: `action_timer_stop` devuelve el asistente `hr.timesheet.stop.timer.confirmation.wizard`, que se crea con `default_timesheet_id` y se confirma con `action_save_timesheet`. Toda escritura del CLI es PREVIEW (código 3) salvo `--yes`; los comandos de tickets son solo lectura. Prueba: `tests/test_api_connections.py`.

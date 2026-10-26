@@ -38,6 +38,7 @@ _HELP_IMG_DIR_NAME = os.path.join("help", "img")
 # Section IDs map to their display label and the bound content renderer
 _SECTIONS: list[tuple[str, str]] = [
     ("intro",       "Introduccion"),
+    ("monitor",     "Monitoreo y alertas"),
     ("tab1",        "Tab 1 — Conexion SSH"),
     ("tab2",        "Tab 2 — Backup"),
     ("tab3",        "Tab 3 — Filestore"),
@@ -97,7 +98,8 @@ class HelpWindow(tk.Toplevel):
         self._img_dir  = self._resolve_img_dir()
         self._current_section = "intro"
 
-        self._configure()
+        # self._configure()
+        self._setup_window()
         self._build_ui()
         self._load_section("intro")
 
@@ -105,7 +107,11 @@ class HelpWindow(tk.Toplevel):
 
     # ── Setup ────────────────────────────────────────────────────────────────
 
-    def _configure(self) -> None:
+    # Was named _configure(), which shadowed tkinter's internal
+    # Misc._configure(): the self.configure(bg=...) call below then landed
+    # back here with extra arguments and raised TypeError, so the help
+    # window could never open.
+    def _setup_window(self) -> None:
         self.title("Ayuda — Odoo Backup Tool")
         self.geometry("1150x740")
         self.minsize(800, 500)
@@ -338,6 +344,77 @@ class HelpWindow(tk.Toplevel):
 
     # ── Section content ──────────────────────────────────────────────────────
 
+    def _section_monitor(self) -> None:
+        self._h1("Monitoreo y alertas")
+        self._p(
+            "Cada cliente con una regla de respaldo programado se vigila con el mismo perfil de "
+            "servidor que usa el respaldo. La barra lateral agrupa las páginas: Monitoreo, Respaldo "
+            "manual, Automatización y Servidor. La aplicación abre en el Panel de clientes."
+        )
+        self._warn(
+            "Motivo: en septiembre de 2026 el respaldo de un cliente falló 19 días seguidos por falta "
+            "de espacio hasta que el disco se llenó y el servicio cayó. El aviso existía solo en el "
+            "Historial; ahora llega por correo."
+        )
+
+        self._h2("Panel de clientes")
+        self._bullet([
+            "Una fila por cliente con su nivel: OK, Alerta, Crítico o Sin datos.",
+            "Disco usado, espacio libre y días estimados hasta llenarse (tendencia de 14 días).",
+            "Último respaldo correcto y respaldos fallidos seguidos.",
+            "Estado de PostgreSQL y de Odoo en el servidor.",
+            "Al seleccionar un cliente: diagnóstico y gráfica de uso de disco de 30 días.",
+            "«Sondear ahora» consulta todos los servidores de inmediato (solo lectura).",
+        ])
+        self._note("«Sin datos» significa que el último sondeo es demasiado antiguo: no equivale a OK.")
+
+        self._h2("Qué genera una alerta (valores por defecto)")
+        self._bullet([
+            "Disco usado: alerta 80 %, crítico 90 %.",
+            "Días estimados hasta llenarse: alerta 21, crítico 7.",
+            "Respaldos fallidos seguidos: alerta 2, crítico 3 (uno solo no alerta).",
+            "Días sin un respaldo correcto: alerta 3, crítico 5.",
+            "Servidor inalcanzable por SSH: alerta 1 sondeo, crítico 2 seguidos.",
+            "PostgreSQL sin aceptar conexiones: crítico.",
+            "El próximo respaldo no cabe en /tmp: alerta.",
+        ])
+        self._p("Los umbrales y el intervalo de sondeo (6 horas) se cambian en la página Configuración.")
+
+        self._h2("Correo de alertas")
+        self._p("En Configuración → Correo de alertas. Se envía un correo:")
+        self._bullet([
+            "cuando un cliente entra en alerta o en crítico, se agrava o se recupera;",
+            "cada 24 horas mientras algo siga en crítico;",
+            "una vez al día con el resumen de todos los clientes (8:00 por defecto).",
+        ])
+        self._ok("Si un día no llega el resumen diario, el monitor no está en ejecución.")
+        self._h3("Google Workspace / Gmail")
+        self._bullet([
+            "Pulse «Usar Google Workspace (Gmail)»: smtp.gmail.com, puerto 587, STARTTLS.",
+            "Usuario y remitente: la dirección completa de la cuenta.",
+            "Contraseña: una contraseña de aplicación de 16 caracteres "
+            "(myaccount.google.com/apppasswords, requiere verificación en dos pasos), no la de la cuenta.",
+            "Use «Enviar correo de prueba» antes de «Guardar».",
+        ])
+        self._note("El mensaje de prueba aparece en «Enviados» del remitente y llega a los destinatarios.")
+
+        self._h2("Monitor en segundo plano")
+        self._p(
+            "Los respaldos programados y el monitoreo solo corren si hay una instancia en ejecución. "
+            "El interruptor «Monitor en segundo plano» (Configuración) hace que Windows inicie la "
+            "herramienta sin ventana en cada inicio de sesión."
+        )
+        self._bullet([
+            "Activar: registra el inicio automático (sin permisos de administrador) y lo arranca ya.",
+            "Desactivar: quita el registro y lo detiene.",
+            "Con la ventana abierta, ella ejecuta el programador y el monitor espera; al cerrarla, "
+            "el monitor lo asume en menos de un minuto.",
+            "Si la ventana se abre con el monitor a cargo, funciona como visor y «Ejecutar ahora» se "
+            "delega al monitor.",
+        ])
+        self._warn("Solo una instancia ejecuta el programador: nunca hay respaldos duplicados.")
+        self._note("Registro del monitor: ~/.odoo_backup_tool/headless.log")
+
     def _section_intro(self) -> None:
         self._h1("Odoo Backup Tool")
         self._p(
@@ -357,6 +434,8 @@ class HelpWindow(tk.Toplevel):
             "Sincronizar addons desde repositorios Git privados (con soporte de submodulos).",
             "Explorar y administrar archivos en servidores remotos via SFTP.",
             "Terminal SSH interactiva integrada (xterm-256color, historial de comandos).",
+            "Monitorear la salud de los servidores de los clientes y avisar por correo antes de que "
+            "un problema tumbe el servicio (ver «Monitoreo y alertas»).",
         ])
 
         self._h2("Requisitos previos")

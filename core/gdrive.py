@@ -828,7 +828,14 @@ class DriveUploader:
             if page_token:
                 params["pageToken"] = page_token
 
-            result     = svc.files().list(**params).execute()
+            # result     = svc.files().list(**params).execute()
+            # The listing goes through _with_retry like the deletes below: a
+            # transient Drive 500 here (2026-10-13, backup_equiredes) used to
+            # abort the whole rule right after all uploads had been verified.
+            result     = _with_retry(
+                lambda p=dict(params): svc.files().list(**p).execute(),
+                log_callback=log_callback,
+            )
             files      = result.get("files", [])
             page_token = result.get("nextPageToken")
 

@@ -18,6 +18,7 @@ import re
 from typing import Callable
 
 from .ssh_client import SSHClient
+from .pg_exec import PgTarget, build_psql, build_createdb, build_dropdb, wrap_exec
 
 # Rutas candidatas para la configuracion de Odoo
 _CONF_CANDIDATES = [
@@ -39,8 +40,9 @@ _KEYS_DELETE = ("database.expiration_reason", "database.expiration_date")
 class TrialManager:
     """Gestiona la creacion de BD limpia y la transferencia de parametros trial."""
 
-    def __init__(self, ssh: SSHClient) -> None:
+    def __init__(self, ssh: SSHClient, target: PgTarget | None = None) -> None:
         self._ssh = ssh
+        self._target = target or PgTarget()
 
     # ── Deteccion de Odoo ─────────────────────────────────────────────────────
 
@@ -53,6 +55,9 @@ class TrialManager:
           2. Busca el binario con find si el proceso no esta activo.
           3. Prueba rutas de config conocidas.
 
+        En modo contenedor (self._target.container), los tres pasos corren
+        DENTRO del contenedor via 'docker exec' en vez de en el host.
+
         Returns:
             (odoo_bin_path, odoo_conf_path) — cadenas vacias si no se encuentra.
         """
@@ -61,7 +66,8 @@ class TrialManager:
 
         # ── 1. Proceso en ejecucion ──────────────────────────────────────────
         _, ps_out, _ = self._ssh.execute(
-            "ps aux | grep -E '(odoo-bin|odoo\\.py)' | grep -v grep | head -5"
+            wrap_exec(self._target,
+                "ps aux | grep -E '(odoo-bin|odoo\\.py)' | grep -v grep | head -5")
         )
         if ps_out.strip():
             for line in ps_out.splitlines():
@@ -77,8 +83,9 @@ class TrialManager:
         # ── 2. Busqueda del binario si el proceso no esta corriendo ──────────
         if not odoo_bin:
             _, find_out, _ = self._ssh.execute(
-                "find /opt /usr /home -maxdepth 7 -name 'odoo-bin' -type f "
-                "2>/dev/null | head -3",
+                wrap_exec(self._target,
+                    "find /opt /usr /home -maxdepth 7 -name 'odoo-bin' -type f "
+                    "2>/dev/null | head -3"),
                 timeout=20,
             )
             for line in find_out.splitlines():
@@ -90,7 +97,7 @@ class TrialManager:
         # ── 3. Busqueda del config si no se encontro en el proceso ───────────
         if not odoo_conf:
             for path in _CONF_CANDIDATES:
-                code, _, _ = self._ssh.execute(f"test -f {path}")
+                code, _, _ = self._ssh.execute(wrap_exec(self._target, f"test -f {path}"))
                 if code == 0:
                     odoo_conf = path
                     break
@@ -126,12 +133,12 @@ class TrialManager:
 
         # Limpiar BD residual de una ejecucion anterior (si existe)
         _log(f"Verificando si '{db_name}' ya existe ...")
-        self._ssh.execute(f"sudo -u postgres dropdb --if-exists {db_name}")
+        self._ssh.execute(build_dropdb(self._target, f"--if-exists {db_name}"))
 
         # Crear BD en blanco con el owner odoo para que peer auth funcione
         _log(f"Creando BD PostgreSQL '{db_name}' (owner: odoo) ...")
         code, _, err = self._ssh.execute(
-            f"sudo -u postgres createdb -O odoo {db_name}"
+            build_createdb(self._target, f"-O odoo {db_name}")
         )
         if code != 0:
             raise RuntimeError(f"Error al crear la BD '{db_name}':\n{err}")
@@ -142,15 +149,27 @@ class TrialManager:
         def _heartbeat(status: str) -> None:
             _log(f"  [odoo init] {status}")
 
-        # Ejecutar como usuario 'odoo' para que la autenticacion peer de
-        # PostgreSQL funcione (el config usa db_user = odoo con peer auth).
+        # Bare-metal: se ejecuta como usuario 'odoo' para que la
+        # autenticacion peer de PostgreSQL funcione (el config usa
+        # db_user = odoo con peer auth). En contenedor, el proceso de
+        # 'docker exec' ya corre con el usuario por defecto de la imagen
+        # (tipicamente 'odoo'), asi que no se antepone sudo -u odoo.
         # --no-http evita abrir el servidor web durante la inicializacion.
+        odoo_init_cmd = f"{odoo_bin} -c {odoo_conf} -d {db_name} -i base --stop-after-init --no-http"
+        if self._target.container:
+            odoo_init_cmd = wrap_exec(self._target, odoo_init_cmd)
+        else:
+            odoo_init_cmd = f"sudo -u odoo {odoo_init_cmd}"
+
+        watch_cmd = build_psql(
+            self._target,
+            f"-d {db_name} -t -c \"SELECT count(*) FROM ir_config_parameter\" "
+            f"2>/dev/null || echo 'inicializando...'",
+        )
+
         code, _, err = self._ssh.execute_long(
-            f"sudo -u odoo {odoo_bin} -c {odoo_conf} -d {db_name} "
-            f"-i base --stop-after-init --no-http",
-            watch_cmd=f"sudo -u postgres psql -d {db_name} -t -c "
-                      f"\"SELECT count(*) FROM ir_config_parameter\" 2>/dev/null "
-                      f"|| echo 'inicializando...'",
+            odoo_init_cmd,
+            watch_cmd=watch_cmd,
             heartbeat_callback=_heartbeat,
             heartbeat_interval=15,
             timeout=600,
@@ -158,7 +177,7 @@ class TrialManager:
         )
         if code != 0:
             # Intentar limpiar la BD fallida
-            self._ssh.execute(f"sudo -u postgres dropdb --if-exists {db_name}")
+            self._ssh.execute(build_dropdb(self._target, f"--if-exists {db_name}"))
             raise RuntimeError(
                 f"Error al inicializar Odoo en '{db_name}':\n{err or '(sin detalle)'}"
             )
@@ -183,8 +202,7 @@ class TrialManager:
             "ORDER BY key"
         )
         code, out, err = self._ssh.execute(
-            f"sudo -u postgres psql -d {db_name} -t -A "
-            f"--field-separator='|' -c \"{sql}\""
+            build_psql(self._target, f"-d {db_name} -t -A --field-separator='|' -c \"{sql}\"")
         )
         if code != 0:
             raise RuntimeError(
@@ -208,7 +226,7 @@ class TrialManager:
 
     def drop_db(self, db_name: str) -> None:
         """Elimina la BD temporal (best-effort, no lanza excepciones)."""
-        self._ssh.execute(f"sudo -u postgres dropdb --if-exists {db_name}")
+        self._ssh.execute(build_dropdb(self._target, f"--if-exists {db_name}"))
 
     # ── Aplicar valores trial ─────────────────────────────────────────────────
 
@@ -275,7 +293,7 @@ class TrialManager:
         _log(f"Aplicando {len(statements)} operacion(es) en '{target_db}' ...")
 
         code, out, err = self._ssh.execute(
-            f"sudo -u postgres psql -d {target_db} -c \"{sql_block}\""
+            build_psql(self._target, f"-d {target_db} -c \"{sql_block}\"")
         )
         if code != 0:
             raise RuntimeError(
@@ -300,14 +318,23 @@ class TrialManager:
     def list_databases(self) -> list[str]:
         """Lista todas las BDs no-sistema disponibles en el servidor."""
         _SYSTEM = {"template0", "template1", "postgres"}
+        # Consulta directa a pg_database en vez de 'psql -l': ver comentario
+        # equivalente en core.db_manager.DBManager.list_databases() — 'psql -l'
+        # imprime la ACL de template0/template1 en varias lineas cuando tiene
+        # mas de una entrada, y splitlines() confundia esas lineas extra con
+        # nombres de BD inexistentes (confirmado en Postgres 15 dockerizado).
+        # -d postgres: sin -d, psql en modo contenedor intenta conectar a
+        # una BD con el mismo nombre que el usuario -U, que no existe
+        # (confirmado: "database 'odoo' does not exist" contra Pruebas_19).
+        sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname"
         code, out, err = self._ssh.execute(
-            "sudo -u postgres psql -l -t -A --field-separator='|'"
+            build_psql(self._target, f"-d postgres -t -A -c \"{sql}\"")
         )
         if code != 0:
             raise RuntimeError(f"No se pudo listar las bases de datos:\n{err}")
         dbs: list[str] = []
         for line in out.splitlines():
-            name = line.split("|")[0].strip()
+            name = line.strip()
             if name and name not in _SYSTEM:
                 dbs.append(name)
         return sorted(dbs)

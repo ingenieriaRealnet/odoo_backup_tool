@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 # ── Storage paths ─────────────────────────────────────────────────────────────
 _DATA_DIR      = Path.home() / ".odoo_backup_tool"
 _SCHEDULE_FILE = _DATA_DIR / "schedules.json"
+# Drop-box for "run this rule now" requests from a non-owner instance —
+# see BackupScheduler._consume_run_requests().
+_RUN_REQUEST_DIR = _DATA_DIR / "run_requests"
 
 # ── Backup naming helpers ─────────────────────────────────────────────────────
 _TIMESTAMP_FMT = "%Y-%m-%d_%H-%M"
@@ -44,6 +47,17 @@ _TIMESTAMP_FMT = "%Y-%m-%d_%H-%M"
 
 def _ts_now() -> str:
     return datetime.now().strftime(_TIMESTAMP_FMT)
+
+
+def request_rule_run(rule_id: str) -> None:
+    """
+    Ask the instance that owns the scheduler to run a rule on its next tick.
+
+    Used by a GUI that is not the scheduler owner (the headless monitor
+    is). The request is an empty file named after the rule id.
+    """
+    _RUN_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    (_RUN_REQUEST_DIR / f"{rule_id}.req").touch()
 
 
 # ── Default rule template ─────────────────────────────────────────────────────
@@ -91,15 +105,49 @@ class ScheduleManager:
     def __init__(self) -> None:
         self._lock    = threading.Lock()
         self._rules:  list[dict] = []
+        # mtime of schedules.json as last read/written by THIS instance —
+        # see _reload_if_changed().
+        self._mtime: float = 0.0
+        # Optional observer called as on_result(rule_id, result, message)
+        # after every recorded run. Used by core.monitor.HealthMonitor to
+        # track consecutive failures without BackupScheduler having to know
+        # about monitoring at each of its result call sites.
+        self.on_result: Callable[[str, str, str], None] | None = None
         self._load()
 
     # ── Persistence ──────────────────────────────────────────────────────────
+
+    def _reload_if_changed(self) -> None:
+        """
+        Re-read schedules.json if another process modified it. Must be
+        called with self._lock held.
+
+        The GUI and the headless monitor (main.py --headless) can both be
+        running: the GUI edits rules while the headless process executes
+        them. Without this, the headless process would keep running the
+        rules it loaded at startup and, worse, overwrite the GUI's edits
+        the next time it recorded a run result.
+        """
+        try:
+            mtime = _SCHEDULE_FILE.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._mtime:
+            return
+        previous = self._rules
+        self._load()
+        if not self._rules and previous:
+            # Unreadable mid-change: keep what we had rather than dropping
+            # every rule; the next call retries.
+            self._rules = previous
+            self._mtime = 0.0
 
     def _load(self) -> None:
         """Load rules from disk. Silently starts empty on any error."""
         if not _SCHEDULE_FILE.exists():
             return
         try:
+            self._mtime = _SCHEDULE_FILE.stat().st_mtime
             with open(_SCHEDULE_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             # Back-fill any missing keys added in later versions.
@@ -129,17 +177,20 @@ class ScheduleManager:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump({"rules": self._rules}, fh, indent=2, ensure_ascii=False)
         os.replace(tmp_path, _SCHEDULE_FILE)
+        self._mtime = _SCHEDULE_FILE.stat().st_mtime
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def list_rules(self) -> list[dict]:
         """Return a shallow copy of all rules (safe for GUI iteration)."""
         with self._lock:
+            self._reload_if_changed()
             return [dict(r) for r in self._rules]
 
     def get(self, rule_id: str) -> dict | None:
         """Return a copy of the rule with the given id, or None."""
         with self._lock:
+            self._reload_if_changed()
             for r in self._rules:
                 if r["id"] == rule_id:
                     return dict(r)
@@ -154,6 +205,7 @@ class ScheduleManager:
         rule = {**_default_rule(), **partial}
         rule["id"] = str(uuid.uuid4())   # always generate a fresh id
         with self._lock:
+            self._reload_if_changed()
             self._rules.append(rule)
             self._save()
         return dict(rule)
@@ -165,6 +217,7 @@ class ScheduleManager:
         Returns True if the rule was found and updated.
         """
         with self._lock:
+            self._reload_if_changed()
             for i, r in enumerate(self._rules):
                 if r["id"] == rule_id:
                     self._rules[i] = {**r, **partial}
@@ -179,6 +232,7 @@ class ScheduleManager:
         Returns True if removed.
         """
         with self._lock:
+            self._reload_if_changed()
             before = len(self._rules)
             self._rules = [r for r in self._rules if r["id"] != rule_id]
             if len(self._rules) < before:
@@ -198,6 +252,11 @@ class ScheduleManager:
             "last_result":  result,
             "last_message": message,
         })
+        if self.on_result is not None:
+            try:
+                self.on_result(rule_id, result, message)
+            except Exception:  # noqa: BLE001 — an observer must never break a backup
+                logger.exception("on_result observer failed for rule %s", rule_id)
 
 
 # =============================================================================
@@ -225,8 +284,13 @@ class BackupScheduler:
         burst_stagger_secs: int = 120,
         temp_registry=None,
         history=None,
+        monitor=None,
     ) -> None:
         self._sched   = schedule_mgr
+        # Optional core.monitor.HealthMonitor. Driven from _tick() so client
+        # health is checked on the same cadence, by the same daemon, as the
+        # backups — including on days when every backup fails.
+        self._monitor = monitor
         self._profiles = profile_mgr
         self._q       = notify_queue
         self._interval = poll_interval
@@ -351,9 +415,54 @@ class BackupScheduler:
     def _loop(self) -> None:
         """Main loop: check rules every poll_interval seconds."""
         while not self._stop.wait(timeout=self._interval):
+            # Health monitoring runs even while backups are paused: pausing
+            # the schedule must not blind the operator to a filling disk.
+            self._tick_monitor()
+            # Same for an explicit "Ejecutar ahora": it is a deliberate
+            # one-off, independent of the automatic schedule being paused.
+            self._consume_run_requests()
             if self._paused.is_set():
                 continue
             self._tick()
+
+    def _consume_run_requests(self) -> None:
+        """
+        Run the rules another instance asked for via request_rule_run().
+
+        Only the process that owns the scheduler lock executes rules. When
+        the GUI is open while the headless monitor owns it, the GUI's
+        "Ejecutar ahora" cannot start the job itself without risking the
+        double-run the lock exists to prevent — it leaves a request file
+        here instead and this owner picks it up on its next tick.
+        """
+        try:
+            requests = sorted(_RUN_REQUEST_DIR.glob("*.req"))
+        except OSError:
+            return
+        for request in requests:
+            rule_id = request.stem
+            try:
+                request.unlink()
+            except OSError:
+                continue  # could not claim it; retry next tick
+            rule = self._sched.get(rule_id)
+            if not rule:
+                continue
+            label = rule.get("label") or rule.get("db_name", rule_id[:8])
+            if self.run_rule_now(rule):
+                self._log(rule_id, f"[{label}] Ejecucion manual solicitada desde la aplicacion.")
+            else:
+                self._log(rule_id, f"[{label}] Ejecucion manual ignorada: la regla ya esta corriendo.")
+
+    def _tick_monitor(self) -> None:
+        """Give the health monitor its turn (returns immediately)."""
+        if self._monitor is None:
+            return
+        try:
+            # The cycle itself runs in its own thread — see HealthMonitor.
+            self._monitor.maybe_run_cycle()
+        except Exception:  # noqa: BLE001 — monitoring must never block backups
+            logger.exception("health monitor tick failed")
 
     def _tick(self) -> None:
         """Evaluate all rules; fire any that are due and not already running."""
@@ -515,6 +624,7 @@ class BackupScheduler:
         from .db_manager        import DBManager
         from .filestore_manager import FilestoreManager
         from .transfer          import TransferManager
+        from .pg_exec           import PgTarget
 
         rule_id = rule["id"]
         label   = rule.get("label") or rule.get("db_name", rule_id[:8])
@@ -586,7 +696,11 @@ class BackupScheduler:
             if entry_id:
                 self._temp_registry.unregister(entry_id)
 
-        db_mgr = DBManager(ssh)
+        pg_target = PgTarget(
+            container=profile.get("docker_container", ""),
+            docker_exec_user=profile.get("docker_exec_user", ""),
+        )
+        db_mgr = DBManager(ssh, target=pg_target)
         fs_mgr = FilestoreManager(ssh)
         tm     = TransferManager(ssh)
 
@@ -601,12 +715,16 @@ class BackupScheduler:
                 dump_name = f"odoo_{db_name}_{ts}.{ext}"
                 dump_path = f"/tmp/{dump_name}"
                 log(f"[{label}] Generando dump: {dump_path}")
+                # Register BEFORE creating: if the connection drops mid-dump,
+                # the partial file must already be in the manifest so the
+                # orphan sweep removes it (incident 2026-10-24, equiredes).
+                _register(dump_path, "dump")
                 dump_path = db_mgr.create_dump(
                     db_name, fmt, dump_path,
                     log_callback=log,
                 )
                 remote_tmp.append(dump_path)
-                _register(dump_path, "dump")
+                # _register(dump_path, "dump")
                 log(f"[{label}] Dump listo: {dump_path}")
 
             if rule.get("include_filestore") and rule.get("filestore_root"):
@@ -614,12 +732,15 @@ class BackupScheduler:
                 zip_name = f"filestore_{db_name}_{ts}.tar"
                 zip_path = f"/tmp/{zip_name}"
                 log(f"[{label}] Empaquetando filestore: {zip_path}")
+                # Register BEFORE creating: a tar cut off by a dropped SSH
+                # session left 11.6 GB untracked in /tmp on 2026-10-24.
+                _register(zip_path, "filestore")
                 zip_path = fs_mgr.compress_filestore(
                     rule["filestore_root"], fs_db, zip_path,
                     log_callback=log,
                 )
                 remote_tmp.append(zip_path)
-                _register(zip_path, "filestore")
+                # _register(zip_path, "filestore")
                 log(f"[{label}] Filestore comprimido: {zip_path}")
 
             if not remote_tmp:
@@ -676,8 +797,9 @@ class BackupScheduler:
                     _register(inv_remote_path, "inventory")
 
                     all_files = remote_tmp + [inv_remote_path]
+                    _register(bundle_path, "bundle")  # before creating, see dump above
                     bm.create(bundle_path, all_files, log_callback=log)
-                    _register(bundle_path, "bundle")
+                    # _register(bundle_path, "bundle")
 
                     # Remove the individual files — bundle is the single deliverable
                     for f in all_files:
@@ -822,17 +944,28 @@ class BackupScheduler:
                 #   leave the actual backup artifacts un-retained.
                 retention = int(rule.get("retention_days", 90))
                 if retention > 0:
-                    uploader = self._get_uploader(creds_path, folder_id)
-                    prefixes = (
-                        [f"{db_name}_"]
-                        if bundled
-                        else [f"odoo_{db_name}_", f"filestore_{db_name}_", f"{db_name}_"]
-                    )
-                    deleted = 0
-                    for prefix in prefixes:
-                        deleted += uploader.cleanup_old_files(prefix, retention, log_callback=log)
-                    if deleted:
-                        log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
+                    # Retention is housekeeping: by now every upload is verified,
+                    # so a failure here must not mark the backup as failed nor
+                    # skip the server /tmp cleanup below (2026-10-13,
+                    # backup_equiredes: Drive 500 on the listing -> "error" and
+                    # ~15 GB left in /tmp). Old files get retried next run.
+                    try:
+                        uploader = self._get_uploader(creds_path, folder_id)
+                        prefixes = (
+                            [f"{db_name}_"]
+                            if bundled
+                            else [f"odoo_{db_name}_", f"filestore_{db_name}_", f"{db_name}_"]
+                        )
+                        deleted = 0
+                        for prefix in prefixes:
+                            deleted += uploader.cleanup_old_files(prefix, retention, log_callback=log)
+                        if deleted:
+                            log(f"[{label}] Retencion: {deleted} archivo(s) eliminados de Drive.")
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[{label}] [aviso] No se pudo aplicar la retencion en Drive "
+                            f"(se reintentara en la proxima ejecucion): {exc}"
+                        )
 
             # ── Cleanup server tmp files ──────────────────────────────────────
             if rule.get("cleanup_server"):
